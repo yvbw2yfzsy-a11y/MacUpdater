@@ -1,14 +1,29 @@
-Einrichten (im Terminal):
+# macupdate
 
-Die Datei macupdate herunterladen. Sie landet normalerweise in „Downloads“.
-bash ~/Downloads/macupdate --install ausführen. Es fragt einmal nach deinem Admin-Passwort und ein paar Einstellungen (Uhrzeit, Aufwecken, fehlende Apps, macOS-Passwort).
-Zum Testen macupdate -c ausführen. Das zeigt nur, was es Neues gibt, und installiert nichts.
-Danach einmal macupdate -u starten, während du am Mac sitzt.
+Automatische nächtliche Updates für deinen Mac – in fester Reihenfolge:
+Craft-Apps (GitHub) → Homebrew → App Store → macOS.
 
-Befehle
+## Einrichten (im Terminal)
 
--u / --update: alles jetzt aktualisieren, in deiner Reihenfolge (Craft-Apps → Homebrew → App Store → macOS)
--s / --skip: den nächsten Nachtlauf auslassen; --unskip hebt das wieder auf
--e / --settings: Einstellungsdatei öffnen. Eine geänderte Uhrzeit gilt sofort nach dem Schließen.
--h / --help: Hilfe
-Zusätzlich: -c (nur prüfen), --status, -l (Protokoll), --uninstall
+1. Die Datei `macupdate` herunterladen. Sie landet normalerweise in „Downloads“.
+2. `bash ~/Downloads/macupdate --install` ausführen. Es fragt einmal nach deinem Admin-Passwort und ein paar Einstellungen (Uhrzeit, macOS-Passwort, fehlende Apps, Aufwecken).
+3. Zum Testen `macupdate -c` ausführen. Das zeigt nur, was es Neues gibt, und installiert nichts.
+4. Danach einmal `macupdate -u` starten, während du am Mac sitzt.
+
+## Befehle
+
+| Option | Wirkung |
+|---|---|
+| `-u`, `--update` | alles jetzt aktualisieren |
+| `-c`, `--check` | nur prüfen, nichts installieren |
+| `-s`, `--skip` | den nächsten Nachtlauf auslassen |
+| `--unskip` | Auslassen wieder aufheben |
+| `-e`, `--edit` | Einstellungsdatei bearbeiten. Eine geänderte Uhrzeit gilt sofort nach dem Schließen. |
+| `--status` | Zeitplan, nächster und letzter Lauf |
+| `-l`, `--log` | Protokoll des letzten Laufs |
+| `-v`, `--version` | Versionsnummer |
+| `-h`, `--help` | Hilfe |
+| `--install` | einrichten oder aktualisieren |
+| `--uninstall` | alles wieder entfernen |
+
+`--settings` funktioniert weiterhin als alter Name für `--edit`.

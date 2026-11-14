@@ -15,7 +15,7 @@
 #  Bitte keine Bash-4-Features einbauen (assoziative Arrays, mapfile, ${x,,} …).
 #
 
-MACUPDATE_VERSION="1.0.0"
+MACUPDATE_VERSION="1.1.0"
 
 # ── Pfade ─────────────────────────────────────────────────────────────────────
 # MACUPDATE_TEST_ROOT ist nur für automatische Tests gedacht und sonst leer.
@@ -61,6 +61,7 @@ MACOS_SCOPE="minor"
 SUM_GITHUB=""; SUM_BREW=""; SUM_MAS=""; SUM_MACOS=""
 CHANGES=()
 GH_MNT=""
+GH_WORK=""
 SUDO_KEEPALIVE_PID=""
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -351,18 +352,22 @@ user_is_idle() {
   is_uint "$s" && (( s >= IDLE_MINUTES * 60 ))
 }
 
+# Der Text wird als Argument (argv) übergeben und nicht in den AppleScript-Code
+# eingesetzt – so können Anführungszeichen oder Backslashes nichts kaputt machen.
 notify() {
   [[ $NOTIFY == yes ]] || return 0
-  local msg=${1//\"/\'} script
-  script="display notification \"$msg\" with title \"macupdate\""
-  LC_ALL=en_US.UTF-8 osascript -e "$script" >/dev/null 2>&1 || true
+  LC_ALL=en_US.UTF-8 osascript -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title "macupdate"' \
+    -e 'end run' "$1" >/dev/null 2>&1 || true
 }
 
 # Dialog auf dem Bildschirm. Erfolg = "Jetzt neu starten" gewählt.
 # Ohne Antwort nach 3 Minuten gilt "Später".
 ask_restart_dialog() {
-  local text=${1//\"/\'} out
-  out=$(LC_ALL=en_US.UTF-8 run_with_timeout 200 osascript -e "display dialog \"$text\" with title \"macupdate\" buttons {\"Später\", \"Jetzt neu starten\"} default button \"Später\" with icon caution giving up after 180" 2>/dev/null)
+  local out
+  out=$(LC_ALL=en_US.UTF-8 run_with_timeout 200 osascript -e 'on run argv' \
+    -e 'display dialog (item 1 of argv) with title "macupdate" buttons {"Später", "Jetzt neu starten"} default button "Später" with icon caution giving up after 180' \
+    -e 'end run' "$1" 2>/dev/null)
   case $out in
     *"gave up:true"*) return 1 ;;
     *"Jetzt neu starten"*) return 0 ;;
@@ -513,7 +518,8 @@ GITHUB_TEAM_ID="DJ6XS33FX8"
 # Zurückholen: Endung ".backup" entfernen und die App nach /Applications ziehen.
 GITHUB_KEEP_BACKUP="yes"
 
-# Optional: GitHub-Token – nur nötig, falls das GitHub-API-Limit stört
+# Optional: GitHub-Token – nur nötig, falls das GitHub-API-Limit stört.
+# Ist ein Token eingetragen, macht macupdate diese Datei nur für dich lesbar.
 GITHUB_TOKEN=""
 
 # ── 2. Homebrew ─────────────────────────────────────────────────────────
@@ -548,6 +554,7 @@ KEEP_LOGS_DAYS="30"
 # "open -W -e" (TextEdit – danach TextEdit mit Cmd+Q beenden)
 SETTINGS_EDITOR="nano"
 EOF_SETTINGS
+  chmod 600 "$SETTINGS_FILE" 2>/dev/null
 }
 
 valid_repo_entry() {
@@ -558,8 +565,8 @@ valid_repo_entry() {
   esac
   owner=${repo%%/*}
   name=${repo#*/}
-  case $owner in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  case $name in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case $owner in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case $name in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; esac
   return 0
 }
 
@@ -585,16 +592,23 @@ validate_settings() {
     esac
   done
 
+  # Gleiche Schreibweisen wie bei den yes/no-Schaltern oben
   case $(lower "$MACOS_RESTART") in
     auto) MACOS_RESTART=auto ;;
-    yes|ja) MACOS_RESTART=yes ;;
-    no|nein) MACOS_RESTART=no ;;
+    yes|ja|j|y|true|1|on) MACOS_RESTART=yes ;;
+    no|nein|n|false|0|off) MACOS_RESTART=no ;;
     *) problems+=("MACOS_RESTART=\"$MACOS_RESTART\" – erlaubt sind \"auto\", \"yes\" oder \"no\"") ;;
   esac
 
-  case $GITHUB_RUNNING_APPS in
-    quit-if-idle|skip) ;;
+  case $(lower "$GITHUB_RUNNING_APPS") in
+    quit-if-idle) GITHUB_RUNNING_APPS=quit-if-idle ;;
+    skip) GITHUB_RUNNING_APPS=skip ;;
     *) problems+=("GITHUB_RUNNING_APPS=\"$GITHUB_RUNNING_APPS\" – erlaubt sind \"quit-if-idle\" oder \"skip\"") ;;
+  esac
+
+  # GitHub-Tokens bestehen nur aus Buchstaben, Ziffern und "_"
+  case $GITHUB_TOKEN in
+    *[!A-Za-z0-9_]*) problems+=("GITHUB_TOKEN – enthält ungültige Zeichen (erlaubt: A–Z, a–z, 0–9, _)") ;;
   esac
 
   is_uint "$IDLE_MINUTES" || problems+=("IDLE_MINUTES=\"$IDLE_MINUTES\" – erwartet wird eine Zahl")
@@ -622,6 +636,8 @@ load_settings() {
     fi
     # shellcheck disable=SC1090
     . "$SETTINGS_FILE"
+    # Mit Token darf die Datei nicht für andere Benutzer lesbar sein
+    [[ -n $GITHUB_TOKEN ]] && chmod go-rwx "$SETTINGS_FILE" 2>/dev/null
   fi
   validate_settings
 }
@@ -635,6 +651,7 @@ settings_set() {
   else
     printf '%s="%s"\n' "$key" "$val" >> "$SETTINGS_FILE"
   fi
+  chmod 600 "$SETTINGS_FILE" 2>/dev/null
 }
 
 open_in_editor() {
@@ -837,8 +854,12 @@ json_values() {
 gh_api() {
   local -a args
   args=(-fsSL --max-time 30 -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
-  [[ -n $GITHUB_TOKEN ]] && args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
-  curl "${args[@]}" "$1" 2>/dev/null
+  if [[ -n $GITHUB_TOKEN ]]; then
+    # Token über stdin (curl -K -) statt als Argument – sonst stünde es in der Prozessliste (ps)
+    printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | curl -K - "${args[@]}" "$1" 2>/dev/null
+  else
+    curl "${args[@]}" "$1" 2>/dev/null
+  fi
 }
 
 # Das passende macOS-DMG aus der Asset-Liste wählen (keine CLI-Pakete)
@@ -1020,16 +1041,19 @@ swap_app() {  # $1 neue App (Staging)  $2 Ziel  $3 alte App (oder leer)
 
 # Rückgabe: 10 = installiert, 20 = verschoben, 1 = Fehler
 github_install() {  # $1 repo  $2 alte App (oder leer)  $3 Zielordner  $4 App-Name-Vorgabe
-  local work rc
-  if ! work=$(mktemp -d "${TMPDIR:-/tmp}/macupdate.XXXXXX"); then
+  local rc
+  # GH_WORK und GH_MNT sind global, damit run_cleanup sie auch bei einem Abbruch aufräumt
+  if ! GH_WORK=$(mktemp -d "${TMPDIR:-/tmp}/macupdate.XXXXXX"); then
+    GH_WORK=""
     err "  Temporärer Ordner ließ sich nicht anlegen"; return 1
   fi
   GH_MNT=""
-  _github_install "$1" "$2" "$3" "$4" "$work"
+  _github_install "$1" "$2" "$3" "$4" "$GH_WORK"
   rc=$?
   [[ -n $GH_MNT ]] && dmg_detach "$GH_MNT"
   GH_MNT=""
-  rm -rf "$work"
+  rm -rf "$GH_WORK"
+  GH_WORK=""
   return $rc
 }
 
@@ -1418,6 +1442,14 @@ wait_for_network() {
   return 1
 }
 
+# Aufräumen beim Beenden – auch bei Abbruch: DMG aushängen, Download löschen, Sperre lösen
+run_cleanup() {
+  [[ -n $GH_MNT ]] && dmg_detach "$GH_MNT"
+  [[ -n $GH_WORK ]] && rm -rf "$GH_WORK"
+  GH_MNT=""; GH_WORK=""
+  release_lock
+}
+
 keep_awake() {
   command -v caffeinate >/dev/null 2>&1 || return 0
   caffeinate -ims -w $$ >/dev/null 2>&1 &
@@ -1433,11 +1465,18 @@ finish() {
 
   if [[ $RUN_MODE == check ]]; then
     echo
+    # Bei Fehlern (z. B. kein Internet) nie "Alles aktuell" melden
+    if (( ERRORS > 0 )); then
+      echo "⚠ Prüfung unvollständig – $ERRORS Fehler (siehe oben)"
+      (( CHECK_FOUND > 0 )) && echo "→ Gefundene Updates installieren: macupdate -u"
+      exit 1
+    fi
     if (( CHECK_FOUND > 0 )); then echo "→ Jetzt installieren: macupdate -u"; else echo "✓ Alles aktuell"; fi
     exit 0
   fi
 
   if (( ERRORS > 0 )); then status="mit $ERRORS Fehler(n)"; else status="erfolgreich"; fi
+  (( WARNINGS > 0 )) && status="$status, $WARNINGS Hinweis(e)"
   log "Fertig – $status. Protokoll: $LOG_FILE"
   write_last_run "$status" "$LOG_FILE"
   if [[ $RUN_MODE == scheduled ]]; then
@@ -1492,7 +1531,10 @@ cmd_run() {
     echo "Ein anderer macupdate-Lauf ist gerade aktiv – abgebrochen."
     exit 0
   fi
-  trap release_lock EXIT
+  trap run_cleanup EXIT
+  # Bei Ctrl+C oder "launchctl bootout" sauber beenden, damit run_cleanup läuft
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
 
   if [[ $RUN_MODE == scheduled ]]; then
     LOG_FILE="$LOG_DIR/$(date '+%Y-%m-%d_%H%M%S').log"
@@ -1536,9 +1578,10 @@ Benutzung:  macupdate <Option>
   -c, --check       Nur nachsehen, was es Neues gibt (installiert nichts)
   -s, --skip        Den nächsten nächtlichen Lauf überspringen
       --unskip      Überspringen wieder aufheben
-  -e, --settings    Einstellungen öffnen (Uhrzeit, Schritte, Apps …)
+  -e, --edit        Einstellungen bearbeiten (Uhrzeit, Schritte, Apps …)
       --status      Zeitplan, nächster und letzter Lauf
   -l, --log         Protokoll des letzten Laufs anzeigen
+  -v, --version     Versionsnummer anzeigen
   -h, --help        Diese Hilfe
 
       --install     Einrichten oder aktualisieren (braucht dein Admin-Passwort)
@@ -1567,7 +1610,7 @@ cmd_unskip() {
   fi
 }
 
-cmd_settings() {
+cmd_edit() {
   local ed
   mkdir -p "$CONFIG_DIR" "$STATE_DIR"
   [[ -f $SETTINGS_FILE ]] || write_default_settings
@@ -1733,7 +1776,8 @@ EOF_CRED
   fi
   ask_yes_no "Passwort für automatische macOS-Updates speichern?" n || return 0
   printf 'Anmeldepasswort für %s: ' "$USER"
-  read -r -s pw </dev/tty
+  # IFS= : Leerzeichen am Anfang/Ende des Passworts nicht abschneiden
+  IFS= read -r -s pw </dev/tty
   echo
   if [[ -z $pw ]]; then echo "  Kein Passwort eingegeben – übersprungen."; return 0; fi
   if ! printf '%s\n' "$pw" | sudo -S -k -v -p '' 2>/dev/null; then
@@ -1761,6 +1805,8 @@ cmd_install() {
   case $USER in ""|*[!A-Za-z0-9._-]*) die "Benutzername \"$USER\" wird nicht unterstützt." ;; esac
   src=$(self_path)
   [[ -f $src ]] || die "Script-Datei nicht gefunden ($src)."
+  # Das Neuladen des Zeitplans (launchctl bootout) würde einen laufenden Lauf mitten im Update beenden
+  lock_is_held && die "Gerade läuft ein macupdate-Lauf – bitte warten, bis er fertig ist."
 
   cat <<EOF_INTRO
 
@@ -1810,9 +1856,13 @@ EOF_INTRO
   sudo mkdir -p "$HELPER_DIR" || die "Konnte $HELPER_DIR nicht anlegen."
   dir_is_safe "$HELPER_DIR" || die "$HELPER_DIR gehört nicht root oder ist für andere beschreibbar – abgebrochen."
   build_helper | sudo tee "$HELPER.new" >/dev/null || die "Konnte den Helper nicht schreiben."
+  # Erst prüfen, dann aktivieren – ein fehlerhafter Helper ersetzt so nie den funktionierenden
+  if ! bash -n "$HELPER.new"; then
+    sudo rm -f "$HELPER.new"
+    die "Helper fehlerhaft – bitte melden."
+  fi
   sudo chown root:wheel "$HELPER.new" && sudo chmod 755 "$HELPER.new" && sudo mv -f "$HELPER.new" "$HELPER" \
     || die "Konnte den Helper nicht einrichten."
-  bash -n "$HELPER" || die "Helper fehlerhaft – bitte melden."
   echo "✓ Root-Helper installiert"
 
   # 4) mas für den App Store
@@ -1901,11 +1951,13 @@ cmd_uninstall() {
   local wake
   is_macos || die "macupdate läuft nur auf macOS."
   [[ $EUID -eq 0 && -z $_R ]] && die "Bitte ohne sudo starten:  macupdate --uninstall"
+  lock_is_held && die "Gerade läuft ein macupdate-Lauf – bitte warten, bis er fertig ist."
   ask_yes_no "macupdate wirklich entfernen?" n || exit 0
+  # sudo zuerst – sonst bliebe bei falschem Passwort eine halb entfernte Einrichtung zurück
+  sudo -v || die "sudo fehlgeschlagen."
   launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1
   rm -f "$AGENT_PLIST"
   echo "✓ Zeitplan entfernt"
-  sudo -v || die "sudo fehlgeschlagen."
   wake=$(cat "$WAKE_STATE_FILE" 2>/dev/null)
   if [[ -n $wake && $wake != off ]]; then
     sudo pmset repeat cancel && echo "✓ Automatisches Aufwecken entfernt"
@@ -1925,6 +1977,12 @@ cmd_uninstall() {
 # ══════════════════════════════════════════════════════════════════════════════
 main() {
   local arg=${1:-}
+  # Nur eine Option erlaubt – sonst würde z. B. "macupdate -c -u" still nur prüfen
+  if (( $# > 1 )); then
+    printf 'Bitte nur eine Option angeben (erhalten: %s)\n\n' "$*" >&2
+    cmd_help >&2
+    exit 2
+  fi
   # Lange Optionen auch mit einem Bindestrich erlauben (-skip → --skip)
   case $arg in
     -[a-z][a-z]*) arg="-$arg" ;;
@@ -1934,7 +1992,8 @@ main() {
     -c|--check)       cmd_run check ;;
     -s|--skip)        cmd_skip ;;
     --unskip)         cmd_unskip ;;
-    -e|--settings)    cmd_settings ;;
+    -e|--edit)        cmd_edit ;;
+    --settings)       cmd_edit ;;   # alter Name, bleibt für bestehende Gewohnheiten erhalten
     --status)         cmd_status ;;
     -l|--log)         cmd_log ;;
     -h|--help|"")     cmd_help ;;

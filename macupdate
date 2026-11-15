@@ -6,7 +6,13 @@
 #    1. Apps aus GitHub-Releases (PhotoCraft, PdfCraft, WordCraft, DeckCraft, GridCraft)
 #    2. Homebrew (Formeln und Casks)
 #    3. App Store (über das Kommandozeilen-Tool "mas")
-#    4. macOS-Systemupdates (softwareupdate)
+#
+#  macOS-Updates übernimmt macOS selbst (Systemeinstellungen › Allgemein › Softwareupdate).
+#  Ist macOS gerade mit einem Update beschäftigt, wartet macupdate damit.
+#
+#  "mas update" braucht root. Dafür richtet --install einen kleinen Helper ein, der per sudo
+#  ohne Passwort laufen darf – aber nur ohne Argumente und nur für "mas update". Ein Passwort
+#  wird nirgends gespeichert.
 #
 #  Einrichten (einmalig im Terminal):   bash macupdate --install
 #  Danach:                              macupdate --help
@@ -15,19 +21,34 @@
 #  Bitte keine Bash-4-Features einbauen (assoziative Arrays, mapfile, ${x,,} …).
 #
 
-MACUPDATE_VERSION="1.1.0"
+MACUPDATE_VERSION="2.1.1"
 
 # ── Pfade ─────────────────────────────────────────────────────────────────────
 # MACUPDATE_TEST_ROOT ist nur für automatische Tests gedacht und sonst leer.
 _R="${MACUPDATE_TEST_ROOT:-}"
 
 INSTALL_BIN="$_R/usr/local/bin/macupdate"
-HELPER_DIR="$_R/Library/PrivilegedHelperTools"
-HELPER="$HELPER_DIR/local.macupdate.helper"
-HELPER_MAS="$HELPER_DIR/local.macupdate.mas"
-HELPER_CRED="$HELPER_DIR/local.macupdate.cred"
-SUDOERS_FILE="$_R/etc/sudoers.d/macupdate"
 APP_DIRS=("$_R/Applications" "$HOME/Applications")
+# App-Store-Helper: darf per sudo ohne Passwort laufen – aber nur ohne Argumente,
+# und er kann nichts außer "mas update" (mit einer root-eigenen Kopie von mas).
+HELPER_DIR="$_R/Library/PrivilegedHelperTools"
+STORE_HELPER="$HELPER_DIR/local.macupdate.appstore"
+STORE_MAS="$HELPER_DIR/local.macupdate.appstore-mas"
+STORE_SUDOERS="$_R/etc/sudoers.d/macupdate-appstore"
+STORE_FILES=("$STORE_HELPER" "$STORE_HELPER.new" "$STORE_MAS" "$STORE_MAS.new"
+             "$STORE_SUDOERS" "$STORE_SUDOERS.tmp")
+# Reste von macupdate 1.x (Root-Helper mit mehr Rechten, evtl. gespeichertes Passwort).
+# --install und --uninstall entfernen sie.
+LEGACY_ROOT_FILES=(
+  "$_R/etc/sudoers.d/macupdate"
+  "$_R/etc/sudoers.d/macupdate.tmp"
+  "$_R/Library/PrivilegedHelperTools/local.macupdate.helper"
+  "$_R/Library/PrivilegedHelperTools/local.macupdate.helper.new"
+  "$_R/Library/PrivilegedHelperTools/local.macupdate.mas"
+  "$_R/Library/PrivilegedHelperTools/local.macupdate.mas.new"
+  "$_R/Library/PrivilegedHelperTools/local.macupdate.cred"
+  "$_R/Library/PrivilegedHelperTools/local.macupdate.cred.new"
+)
 
 AGENT_LABEL="local.macupdate.nightly"
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
@@ -44,10 +65,20 @@ STAGE_DIR="$STATE_DIR/staging"
 
 # launchd startet Jobs mit sehr kargem PATH – Homebrew-Pfade ergänzen.
 # Systemwerkzeuge stehen bewusst vorne, damit z. B. GNU-Tools nichts verändern.
-PATH="${MACUPDATE_TEST_PATH:+$MACUPDATE_TEST_PATH:}/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin"
+# MACUPDATE_TEST_PATH (Attrappen) gilt nur zusammen mit MACUPDATE_TEST_ROOT.
+_TP=""
+[[ -n $_R ]] && _TP="${MACUPDATE_TEST_PATH:-}"
+PATH="${_TP:+$_TP:}/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin"
 export PATH
-USER="${USER:-$(id -un)}"
+# Immer der angemeldete Benutzer, nie ein Wert aus der Umgebung: Er steht in der sudo-Regel
+# des App-Store-Helpers und entscheidet die Admin-Prüfung.
+USER=$(id -un)
 export USER
+# Ohne HOME zeigten Einstellungs-, Status- und Protokollpfade (auch für rm -rf) auf /
+if [[ -z ${HOME:-} || ! -d $HOME ]]; then
+  echo "Fehler: HOME ist nicht gesetzt." >&2
+  exit 1
+fi
 
 # ── Laufzeit-Zustand ──────────────────────────────────────────────────────────
 RUN_MODE=""          # scheduled | manual | check
@@ -56,20 +87,18 @@ LOG_FILE=""
 ERRORS=0
 WARNINGS=0
 CHECK_FOUND=0
-MACOS_PENDING=0      # 1 = macOS-Update mit Neustart wird ganz am Ende installiert
-MACOS_SCOPE="minor"
-SUM_GITHUB=""; SUM_BREW=""; SUM_MAS=""; SUM_MACOS=""
+SKIP_REASON=""       # gesetzt, wenn ein Lauf bewusst ausgelassen wird
+SUM_GITHUB=""; SUM_BREW=""; SUM_MAS=""
 CHANGES=()
 GH_MNT=""
 GH_WORK=""
-SUDO_KEEPALIVE_PID=""
+ROOT_HINT_SHOWN=0
+ROOT_USED=0          # 1 = as_root lief; drop_root gibt die Admin-Rechte danach wieder ab
+STORE_MAS_SRC=""     # --install: mas-Programm für die root-Kopie (leer = vorhandene behalten)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Gemeinsame Funktionen – werden zusätzlich wortgleich in den Root-Helper
-#  geschrieben (siehe build_helper).
+#  Grundfunktionen
 # ══════════════════════════════════════════════════════════════════════════════
-IFS= read -r -d '' SHARED_FUNCS <<'EOF_SHARED'
-# ── Gemeinsame Funktionen (stehen auch im Hauptscript) ──────────────────────
 
 is_uint() { case $1 in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
@@ -83,182 +112,26 @@ run_with_timeout() {
   pid=$!
   (
     trap 'kill "$sp" 2>/dev/null; exit 0' TERM
+    # Startzeit merken: Ist der Aufrufer schon weg (z. B. nach Ctrl+C), kann die PID
+    # inzwischen einem fremden Prozess gehören – den darf der Wächter nie beenden.
+    started=$(ps -o lstart= -p "$pid" 2>/dev/null)
     sleep "$secs" &
     sp=$!
     wait "$sp"
+    [[ -n $started && $(ps -o lstart= -p "$pid" 2>/dev/null) == "$started" ]] || exit 0
     kill -TERM "$pid" 2>/dev/null
     sleep 10 &
     sp=$!
     wait "$sp"
+    [[ $(ps -o lstart= -p "$pid" 2>/dev/null) == "$started" ]] || exit 0
     kill -KILL "$pid" 2>/dev/null
   ) >/dev/null 2>&1 &
   watcher=$!
-  wait "$pid"
+  wait "$pid" 2>/dev/null   # 2>/dev/null: kein "Terminated …" im Protokoll nach Zeitlimit
   rc=$?
   kill -TERM "$watcher" 2>/dev/null
   wait "$watcher" 2>/dev/null
   return $rc
-}
-
-# Ausgabe von "softwareupdate --list" (über stdin) zerlegen.
-# $1 = installierte macOS-Hauptversion (z. B. 26)
-# Ausgabe: pro Update eine Zeile  neustart|grosses_upgrade|label|titel|version
-su_parse_list() {
-  local cur=$1 line label="" title="" version="" restart=0 major=0 vmaj
-  while IFS= read -r line || [[ -n $line ]]; do
-    case $line in
-      *"Label: "*)
-        if [[ -n $label ]]; then
-          printf '%s|%s|%s|%s|%s\n' "$restart" "$major" "$label" "$title" "$version"
-        fi
-        label=${line#*Label: }
-        label=${label%"${label##*[![:space:]]}"}
-        title=""; version=""; restart=0; major=0
-        ;;
-      *"Title: "*)
-        [[ -n $label ]] || continue
-        title=${line#*Title: }
-        title=${title%%, Version:*}
-        version=""
-        case $line in
-          *"Version: "*) version=${line#*Version: }; version=${version%%,*} ;;
-        esac
-        case $line in
-          *"Action: restart"*|*"Action: shut down"*) restart=1 ;;
-        esac
-        case $title in
-          macOS*)
-            vmaj=${version%%.*}
-            if is_uint "$vmaj" && is_uint "$cur" && (( vmaj > cur )); then major=1; fi
-            ;;
-        esac
-        ;;
-    esac
-  done
-  if [[ -n $label ]]; then
-    printf '%s|%s|%s|%s|%s\n' "$restart" "$major" "$label" "$title" "$version"
-  fi
-}
-
-# macOS-Updates installieren – wird nur im Root-Helper aufgerufen.
-# $1 = minor|all (große Upgrades mitnehmen?)   $2 = norestart|restart|download
-macos_install() {
-  local scope=$1 mode=$2 cur items r m label title version agree=0
-  local -a labels extra
-  labels=()
-  extra=()
-  cur=$(sw_vers -productVersion 2>/dev/null)
-  cur=${cur%%.*}
-  items=$(softwareupdate --list 2>&1 | su_parse_list "$cur")
-  while IFS='|' read -r r m label title version; do
-    [[ -n $label ]] || continue
-    if [[ $m == 1 && $scope != all ]]; then continue; fi
-    if [[ $mode == norestart ]]; then
-      [[ $r == 0 ]] || continue
-    else
-      [[ $r == 1 ]] || continue
-    fi
-    labels+=("$label")
-    if [[ $m == 1 ]]; then agree=1; fi
-  done <<< "$items"
-  if (( ${#labels[@]} == 0 )); then
-    echo "Keine passenden macOS-Updates gefunden."
-    return 0
-  fi
-  if [[ $agree == 1 ]]; then extra=(--agree-to-license); fi
-  case $mode in
-    download)
-      run_with_timeout 14400 softwareupdate --download "${labels[@]}"
-      ;;
-    norestart)
-      run_with_timeout 14400 softwareupdate --install "${labels[@]}" "${extra[@]}"
-      ;;
-    restart)
-      if is_arm && [[ -s $CRED_FILE ]]; then
-        run_with_timeout 14400 softwareupdate --install "${labels[@]}" "${extra[@]}" \
-          --restart --user "$SUDO_USER" --stdinpass < "$CRED_FILE"
-      else
-        run_with_timeout 14400 softwareupdate --install "${labels[@]}" "${extra[@]}" --restart
-      fi
-      ;;
-  esac
-}
-EOF_SHARED
-eval "$SHARED_FUNCS"
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Root-Helper (Vorlage). Er wird bei --install nach $HELPER geschrieben,
-#  gehört root und darf als Einziges per sudo ohne Passwort laufen.
-# ══════════════════════════════════════════════════════════════════════════════
-IFS= read -r -d '' HELPER_HEAD <<'EOF_HEAD'
-#!/bin/bash
-#
-#  macupdate – Root-Helper
-#  Wird vom nächtlichen Lauf über "sudo -n" gestartet (Regel: /etc/sudoers.d/macupdate).
-#  Erzeugt von "macupdate --install" – bitte nicht von Hand bearbeiten.
-#  Kennt nur fest eingebaute Aktionen und liest keine Dateien des Benutzers.
-#
-EOF_HEAD
-
-IFS= read -r -d '' HELPER_CHECKS <<'EOF_CHECKS'
-umask 022
-
-die() { echo "macupdate-helper: $*" >&2; exit 2; }
-
-[[ $EUID -eq 0 ]] || die "muss als root laufen"
-case ${SUDO_USER:-} in
-  ""|root) die "nur über sudo aus macupdate heraus aufrufen" ;;
-  *[!A-Za-z0-9._-]*) die "ungültiger Benutzername" ;;
-esac
-EOF_CHECKS
-
-IFS= read -r -d '' HELPER_BODY <<'EOF_BODY'
-action=${1:-}
-[[ $# -gt 0 ]] && shift
-case $action in
-  ping)
-    echo ok
-    ;;
-  has-cred)
-    [[ -s $CRED_FILE ]]
-    ;;
-  wake-set)
-    case ${1:-} in
-      [01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) pmset repeat wake MTWRFSU "$1:00" ;;
-      *) die "ungültige Uhrzeit" ;;
-    esac
-    ;;
-  wake-cancel)
-    pmset repeat cancel
-    ;;
-  mas-upgrade)
-    [[ -x $MAS_BIN ]] || die "mas fehlt – bitte 'macupdate --install' ausführen"
-    run_with_timeout 7200 "$MAS_BIN" update || run_with_timeout 7200 "$MAS_BIN" upgrade
-    ;;
-  macos-install)
-    case ${1:-}/${2:-} in
-      minor/norestart|minor/restart|minor/download|all/norestart|all/restart|all/download)
-        macos_install "$1" "$2"
-        ;;
-      *) die "ungültige Parameter" ;;
-    esac
-    ;;
-  *)
-    die "unbekannte Aktion: $action"
-    ;;
-esac
-EOF_BODY
-
-build_helper() {
-  local hp="/usr/bin:/bin:/usr/sbin:/sbin"
-  # Nur in automatischen Tests (MACUPDATE_TEST_ROOT gesetzt) zeigt der PATH auf Attrappen.
-  [[ -n $_R && -n ${MACUPDATE_TEST_PATH:-} ]] && hp="$MACUPDATE_TEST_PATH:$hp"
-  printf '%s' "$HELPER_HEAD"
-  printf 'PATH=%q\nexport PATH\n' "$hp"
-  printf '%s\n' "$HELPER_CHECKS"
-  printf 'MAS_BIN=%q\nCRED_FILE=%q\n\n' "$HELPER_MAS" "$HELPER_CRED"
-  printf '%s\n' "$SHARED_FUNCS"
-  printf '%s\n' "$HELPER_BODY"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -298,7 +171,8 @@ is_admin() { id -Gn "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx admin; }
 
 find_brew() {
   local b
-  for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+  # $_R: In Tests nie das echte Homebrew starten (sonst liefen brew update/upgrade wirklich)
+  for b in "$_R/opt/homebrew/bin/brew" "$_R/usr/local/bin/brew"; do
     if [[ -x $b ]]; then printf '%s\n' "$b"; return 0; fi
   done
   command -v brew 2>/dev/null
@@ -323,6 +197,9 @@ resolve_path() {
 self_path() { resolve_path "${BASH_SOURCE[0]:-$0}"; }
 
 sha256_of() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null; } | awk '{print $1}'; }
+
+# Ausführbares Programm (Mach-O) – kein Script, kein Wrapper
+is_macho() { [[ -f $1 ]] && file -b "$1" 2>/dev/null | grep -q 'Mach-O'; }
 
 xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
@@ -361,20 +238,6 @@ notify() {
     -e 'end run' "$1" >/dev/null 2>&1 || true
 }
 
-# Dialog auf dem Bildschirm. Erfolg = "Jetzt neu starten" gewählt.
-# Ohne Antwort nach 3 Minuten gilt "Später".
-ask_restart_dialog() {
-  local out
-  out=$(LC_ALL=en_US.UTF-8 run_with_timeout 200 osascript -e 'on run argv' \
-    -e 'display dialog (item 1 of argv) with title "macupdate" buttons {"Später", "Jetzt neu starten"} default button "Später" with icon caution giving up after 180' \
-    -e 'end run' "$1" 2>/dev/null)
-  case $out in
-    *"gave up:true"*) return 1 ;;
-    *"Jetzt neu starten"*) return 0 ;;
-  esac
-  return 1
-}
-
 # ── Uhrzeiten ─────────────────────────────────────────────────────────────────
 # "3", "3:00", "3.00", "03:00" → "03:00"
 normalize_time() {
@@ -398,17 +261,19 @@ wake_time_for() {
   printf '%02d:%02d' $((total / 60)) $((total % 60))
 }
 
-epoch_today_at() {
-  date -j -v"$(time_h "$1")"H -v"$(time_m "$1")"M -v0S +%s 2>/dev/null \
-    || date -d "today $1" +%s 2>/dev/null
+# Unix-Zeit für UHRZEIT in TAGE Tagen:  epoch_at 03:00 1  → morgen 03:00
+epoch_at() {
+  date -j -v+"${2:-0}"d -v"$(time_h "$1")"H -v"$(time_m "$1")"M -v0S +%s 2>/dev/null \
+    || date -d "today +${2:-0} days $1" +%s 2>/dev/null
 }
 
 next_run_epoch() {
   local now t
   now=$(date +%s)
-  t=$(epoch_today_at "$UPDATE_TIME")
+  t=$(epoch_at "$UPDATE_TIME" 0)
   if ! is_uint "$t"; then echo "$now"; return; fi
-  (( t <= now )) && t=$((t + 86400))
+  # "morgen" über das Datum statt +86400 s – sonst eine Stunde daneben bei Zeitumstellung
+  (( t <= now )) && t=$(epoch_at "$UPDATE_TIME" 1)
   echo "$t"
 }
 
@@ -432,7 +297,6 @@ set_defaults() {
   UPDATE_GITHUB_APPS="yes"
   UPDATE_HOMEBREW="yes"
   UPDATE_APPSTORE="yes"
-  UPDATE_MACOS="yes"
   GITHUB_APPS=(
     "storytold/photocraft"
     "storytold/pdfcraft"
@@ -448,8 +312,6 @@ set_defaults() {
   GITHUB_TOKEN=""
   BREW_GREEDY="no"
   BREW_CLEANUP="yes"
-  MACOS_MAJOR_UPGRADES="no"
-  MACOS_RESTART="auto"
   IDLE_MINUTES="30"
   NOTIFY="yes"
   KEEP_LOGS_DAYS="30"
@@ -473,17 +335,17 @@ UPDATE_TIME="03:00"
 # Mac eine Minute vor dieser Uhrzeit aus dem Ruhezustand wecken (pmset).
 # Klappt zuverlässig nur am Netzteil; bei zugeklapptem MacBook nicht garantiert.
 # Ohne Wecken startet ein verpasster Lauf, sobald der Mac wieder wach ist.
+# Ändern braucht einmal Admin-Rechte (Passwort oder Touch ID).
 WAKE_MAC="yes"
 
-# Welche Schritte laufen sollen (die Reihenfolge ist fest: 1 → 2 → 3 → 4)
+# Welche Schritte laufen sollen (die Reihenfolge ist fest: 1 → 2 → 3)
 # 1. Apps von GitHub
 UPDATE_GITHUB_APPS="yes"
 # 2. Homebrew
 UPDATE_HOMEBREW="yes"
 # 3. App Store
 UPDATE_APPSTORE="yes"
-# 4. macOS
-UPDATE_MACOS="yes"
+# macOS-Updates erledigt macOS selbst (Systemeinstellungen › Allgemein › Softwareupdate).
 
 # ── 1. Apps von GitHub ──────────────────────────────────────────────────
 # Eine Zeile pro App:  "besitzer/repo"   oder   "besitzer/repo|AppName"
@@ -529,16 +391,10 @@ BREW_GREEDY="no"
 # Alte Versionen danach aufräumen (brew cleanup)
 BREW_CLEANUP="yes"
 
-# ── 4. macOS ────────────────────────────────────────────────────────────
-# Auch große Versionssprünge installieren (z. B. macOS 26 → 27)?
-MACOS_MAJOR_UPGRADES="no"
-
-# Neustart für macOS-Updates:
-#   "auto" = automatisch neu starten, wenn seit IDLE_MINUTES Minuten niemand
-#            den Mac benutzt hat – sonst erst nachfragen
-#   "yes"  = immer sofort neu starten
-#   "no"   = nur herunterladen; installieren machst du selbst
-MACOS_RESTART="auto"
+# ── 3. App Store ────────────────────────────────────────────────────────
+# "mas update" braucht root. macupdate --install richtet dafür einen Helper ein,
+# der per sudo ohne Passwort laufen darf – aber nur "mas update", ohne Argumente.
+# Ein Passwort wird nirgends gespeichert. Ohne Helper prüft macupdate nur.
 
 # ── Allgemein ───────────────────────────────────────────────────────────
 # Ab wie vielen Minuten ohne Maus/Tastatur der Mac als "unbenutzt" gilt
@@ -581,9 +437,9 @@ validate_settings() {
     problems+=("UPDATE_TIME=\"$UPDATE_TIME\" – erwartet wird eine Uhrzeit wie \"03:00\"")
   fi
 
-  for k in WAKE_MAC UPDATE_GITHUB_APPS UPDATE_HOMEBREW UPDATE_APPSTORE UPDATE_MACOS \
+  for k in WAKE_MAC UPDATE_GITHUB_APPS UPDATE_HOMEBREW UPDATE_APPSTORE \
            GITHUB_INSTALL_MISSING GITHUB_VERIFY_SIGNATURE GITHUB_KEEP_BACKUP \
-           BREW_GREEDY BREW_CLEANUP MACOS_MAJOR_UPGRADES NOTIFY; do
+           BREW_GREEDY BREW_CLEANUP NOTIFY; do
     v=$(lower "${!k}")
     case $v in
       yes|ja|j|y|true|1|on) eval "$k=yes" ;;
@@ -591,14 +447,6 @@ validate_settings() {
       *) problems+=("$k=\"${!k}\" – erlaubt sind \"yes\" oder \"no\"") ;;
     esac
   done
-
-  # Gleiche Schreibweisen wie bei den yes/no-Schaltern oben
-  case $(lower "$MACOS_RESTART") in
-    auto) MACOS_RESTART=auto ;;
-    yes|ja|j|y|true|1|on) MACOS_RESTART=yes ;;
-    no|nein|n|false|0|off) MACOS_RESTART=no ;;
-    *) problems+=("MACOS_RESTART=\"$MACOS_RESTART\" – erlaubt sind \"auto\", \"yes\" oder \"no\"") ;;
-  esac
 
   case $(lower "$GITHUB_RUNNING_APPS") in
     quit-if-idle) GITHUB_RUNNING_APPS=quit-if-idle ;;
@@ -611,8 +459,11 @@ validate_settings() {
     *[!A-Za-z0-9_]*) problems+=("GITHUB_TOKEN – enthält ungültige Zeichen (erlaubt: A–Z, a–z, 0–9, _)") ;;
   esac
 
-  is_uint "$IDLE_MINUTES" || problems+=("IDLE_MINUTES=\"$IDLE_MINUTES\" – erwartet wird eine Zahl")
-  is_uint "$KEEP_LOGS_DAYS" || problems+=("KEEP_LOGS_DAYS=\"$KEEP_LOGS_DAYS\" – erwartet wird eine Zahl")
+  # 10#: führende Nullen ("08") wären in Bash-Rechnungen sonst Oktalzahlen → Fehler
+  if is_uint "$IDLE_MINUTES"; then IDLE_MINUTES=$((10#$IDLE_MINUTES))
+  else problems+=("IDLE_MINUTES=\"$IDLE_MINUTES\" – erwartet wird eine Zahl"); fi
+  if is_uint "$KEEP_LOGS_DAYS"; then KEEP_LOGS_DAYS=$((10#$KEEP_LOGS_DAYS))
+  else problems+=("KEEP_LOGS_DAYS=\"$KEEP_LOGS_DAYS\" – erwartet wird eine Zahl"); fi
 
   for e in "${GITHUB_APPS[@]}"; do
     valid_repo_entry "$e" || problems+=("GITHUB_APPS: \"$e\" – erwartet \"besitzer/repo\" oder \"besitzer/repo|AppName\"")
@@ -626,7 +477,16 @@ validate_settings() {
   return 0
 }
 
+# Schlüssel, die settings.conf setzen darf (dazu das Array GITHUB_APPS).
+# Alte Schlüssel wie MACOS_RESTART oder UPDATE_MACOS werden so still ignoriert.
+readonly SETTINGS_KEYS="UPDATE_TIME WAKE_MAC UPDATE_GITHUB_APPS UPDATE_HOMEBREW UPDATE_APPSTORE
+  GITHUB_INSTALL_MISSING GITHUB_RUNNING_APPS GITHUB_VERIFY_SIGNATURE GITHUB_TEAM_ID
+  GITHUB_KEEP_BACKUP GITHUB_TOKEN BREW_GREEDY BREW_CLEANUP IDLE_MINUTES NOTIFY KEEP_LOGS_DAYS
+  SETTINGS_EDITOR"
+
 load_settings() {
+  local k v complete=0
+  local -a apps
   set_defaults
   if [[ -f $SETTINGS_FILE ]]; then
     if ! bash -n "$SETTINGS_FILE" 2>/dev/null; then
@@ -634,10 +494,35 @@ load_settings() {
       bash -n "$SETTINGS_FILE" 2>&1 | sed 's/^/  /' >&2
       return 1
     fi
-    # shellcheck disable=SC1090
-    . "$SETTINGS_FILE"
-    # Mit Token darf die Datei nicht für andere Benutzer lesbar sein
-    [[ -n $GITHUB_TOKEN ]] && chmod go-rwx "$SETTINGS_FILE" 2>/dev/null
+    # Die Datei läuft in einer Subshell; übernommen werden nur die bekannten Schlüssel
+    # (getrennt durch NUL-Bytes, ohne eval). So kann sie keine internen Variablen oder
+    # Funktionen überschreiben – z. B. INSTALL_BIN, PATH oder as_root, die --install und
+    # --uninstall mit Admin-Rechten benutzen.
+    apps=()
+    while IFS= read -r -d '' k && IFS= read -r -d '' v; do
+      case $k in
+        GITHUB_APPS) apps+=("$v") ;;
+        __END__) complete=1 ;;
+        ""|*[!A-Z_]*) ;;
+        *) [[ " $SETTINGS_KEYS " == *[[:space:]]"$k"[[:space:]]* ]] && printf -v "$k" '%s' "$v" ;;
+      esac
+    done < <(
+      # shellcheck disable=SC1090
+      . "$SETTINGS_FILE" >/dev/null
+      IFS=$' \t\n'
+      for k in $SETTINGS_KEYS; do printf '%s\0%s\0' "$k" "${!k}"; done
+      for v in "${GITHUB_APPS[@]}"; do printf 'GITHUB_APPS\0%s\0' "$v"; done
+      printf '__END__\0\0'
+    )
+    if [[ $complete != 1 ]]; then
+      printf 'Fehler: %s wurde nicht bis zum Ende ausgewertet (exit oder Fehler in der Datei, siehe oben)\n' \
+        "$SETTINGS_FILE" >&2
+      return 1
+    fi
+    GITHUB_APPS=("${apps[@]}")
+    # Mit Token dürfen Datei und Ordner nicht für andere Benutzer lesbar sein
+    # (der Ordner wegen Sicherungs-/Swap-Dateien mancher Editoren)
+    [[ -n $GITHUB_TOKEN ]] && chmod go-rwx "$SETTINGS_FILE" "$CONFIG_DIR" 2>/dev/null
   fi
   validate_settings
 }
@@ -646,8 +531,10 @@ load_settings() {
 settings_set() {
   local key=$1 val=$2 tmp="$SETTINGS_FILE.tmp.$$"
   if grep -q "^$key=" "$SETTINGS_FILE" 2>/dev/null; then
-    awk -v k="$key" -v v="$val" 'index($0, k "=") == 1 { print k "=\"" v "\""; next } { print }' \
-      "$SETTINGS_FILE" > "$tmp" && mv "$tmp" "$SETTINGS_FILE"
+    # umask 077: Die Kopie (evtl. mit GITHUB_TOKEN) ist keinen Moment für andere lesbar
+    ( umask 077
+      awk -v k="$key" -v v="$val" 'index($0, k "=") == 1 { print k "=\"" v "\""; next } { print }' \
+        "$SETTINGS_FILE" > "$tmp" ) && mv "$tmp" "$SETTINGS_FILE"
   else
     printf '%s="%s"\n' "$key" "$val" >> "$SETTINGS_FILE"
   fi
@@ -720,8 +607,12 @@ reload_agent() {
 
 # LaunchAgent und Aufwecken an die Einstellungen anpassen.
 # Nie aus dem nächtlichen Lauf selbst aufrufen (bootout würde ihn beenden).
+#   --wake     Aufwecken bei Bedarf umstellen. pmset braucht Admin-Rechte, macOS fragt
+#              dann nach Passwort oder Touch ID (nur -e und --install).
+#   --no-hint  zum Aufwecken nichts sagen (--status zeigt es selbst an)
+#   sonst      nur ein Hinweis – so fragen -u und -c nie nach Admin-Rechten
 apply_schedule() {
-  local h m want have
+  local h m want
   agent_installed || return 0
   h=$(time_h "$UPDATE_TIME")
   m=$(time_m "$UPDATE_TIME")
@@ -735,26 +626,42 @@ apply_schedule() {
     fi
   fi
 
-  if [[ $WAKE_MAC == yes ]]; then want=$(wake_time_for "$UPDATE_TIME"); else want=off; fi
-  have=$(cat "$WAKE_STATE_FILE" 2>/dev/null)
-  [[ -z $have ]] && have=off
-  [[ $want == "$have" ]] && return 0
+  want=$(wake_wanted)
+  [[ $want == "$(wake_applied)" ]] && return 0
+  case ${1:-} in
+    --wake)    set_wake "$want" ;;
+    --no-hint) ;;
+    *)
+      if [[ $want == off ]]; then
+        echo "Hinweis: Das Aufwecken ist noch eingestellt – 'macupdate -e' (öffnen, schließen) schaltet es aus."
+      else
+        echo "Hinweis: Aufwecken um $want ist noch nicht eingestellt – 'macupdate -e' (öffnen, schließen) stellt es ein."
+      fi
+      ;;
+  esac
+}
+
+# Weckzeit laut Einstellungen ("HH:MM" oder "off") und die zuletzt eingestellte
+wake_wanted()  { if [[ $WAKE_MAC == yes ]]; then wake_time_for "$UPDATE_TIME"; else echo off; fi; }
+wake_applied() { local w; w=$(cat "$WAKE_STATE_FILE" 2>/dev/null); echo "${w:-off}"; }
+
+# Aufwecken setzen ("HH:MM") oder ausschalten ("off") – braucht Admin-Rechte
+set_wake() {
+  local w=$1
   mkdir -p "$STATE_DIR"
-  if [[ $want == off ]]; then
-    if sudo -n "$HELPER" wake-cancel >/dev/null 2>&1; then
+  if [[ $w == off ]]; then
+    if as_root pmset repeat cancel >/dev/null; then
       echo off > "$WAKE_STATE_FILE"
       echo "✓ Automatisches Aufwecken ausgeschaltet"
-    else
-      echo "⚠ Aufwecken ließ sich nicht ändern – bitte 'macupdate --install' ausführen"
+      return 0
     fi
-  else
-    if sudo -n "$HELPER" wake-set "$want" >/dev/null 2>&1; then
-      echo "$want" > "$WAKE_STATE_FILE"
-      echo "✓ Mac wird täglich um $want geweckt"
-    else
-      echo "⚠ Aufwecken ließ sich nicht einstellen – bitte 'macupdate --install' ausführen"
-    fi
+  elif as_root pmset repeat wake MTWRFSU "$w:00" >/dev/null; then
+    echo "$w" > "$WAKE_STATE_FILE"
+    echo "✓ Mac wird täglich um $w geweckt"
+    return 0
   fi
+  echo "⚠ Aufwecken ließ sich nicht ändern"
+  return 1
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -764,9 +671,13 @@ pid_is_macupdate() {
   [[ -n $1 ]] && kill -0 "$1" 2>/dev/null && ps -p "$1" -o command= 2>/dev/null | grep -q macupdate
 }
 acquire_lock() {
+  local pid
   mkdir -p "$STATE_DIR"
   if mkdir "$LOCK_DIR" 2>/dev/null; then echo $$ > "$LOCK_DIR/pid"; return 0; fi
-  pid_is_macupdate "$(cat "$LOCK_DIR/pid" 2>/dev/null)" && return 1
+  pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+  # Ein gerade startender Lauf hat die Sperre evtl. schon, aber seine PID noch nicht geschrieben
+  if [[ -z $pid ]]; then sleep 1; pid=$(cat "$LOCK_DIR/pid" 2>/dev/null); fi
+  pid_is_macupdate "$pid" && return 1
   rm -rf "$LOCK_DIR"      # verwaiste Sperre (z. B. nach Neustart)
   mkdir "$LOCK_DIR" 2>/dev/null || return 1
   echo $$ > "$LOCK_DIR/pid"
@@ -779,20 +690,6 @@ lock_is_held() {
   local pid
   pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
   [[ -n $pid && $pid != "$$" ]] && pid_is_macupdate "$pid"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Root-Helper aufrufen
-# ══════════════════════════════════════════════════════════════════════════════
-privileged() {
-  if sudo -n "$HELPER" ping >/dev/null 2>&1; then
-    sudo -n "$HELPER" "$@"
-  elif [[ $INTERACTIVE == 1 && -x $HELPER ]]; then
-    sudo "$HELPER" "$@"
-  else
-    log "✗ Root-Helper ist nicht eingerichtet – bitte einmal 'macupdate --install' ausführen"
-    return 97
-  fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -811,7 +708,9 @@ gh_save_state() {  # repo tag plist-version app-pfad bundle-id
     "bundle_id=$5" "updated=$(date '+%Y-%m-%d %H:%M')"
 }
 
-plist_get() { defaults read "$1/Contents/Info" "$2" 2>/dev/null; }
+# Info.plist direkt lesen. "defaults" ist laut man-Seite nur für Einstellungs-Domains
+# gedacht und geht über den cfprefsd-Cache.
+plist_get() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/null; }
 
 codesign_team() {
   local t
@@ -824,6 +723,18 @@ codesign_team() {
 normalize_version() {
   local re='([0-9]+(\.[0-9]+)*)'
   if [[ $1 =~ $re ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; fi
+}
+
+# same_version A B  → Erfolg, wenn beide gleich sind ("0.30" = "0.30.0")
+same_version() { [[ -n $1 && -n $2 ]] && ! version_gt "$1" "$2" && ! version_gt "$2" "$1"; }
+
+# Ziel für neue Apps: /Applications, wenn beschreibbar, sonst ~/Applications (wie der Launcher)
+new_app_dir() {
+  if [[ -w ${APP_DIRS[0]} ]]; then
+    printf '%s\n' "${APP_DIRS[0]}"
+  else
+    mkdir -p "${APP_DIRS[1]}" && printf '%s\n' "${APP_DIRS[1]}"
+  fi
 }
 
 # version_gt A B  → Erfolg, wenn A neuer ist als B
@@ -879,54 +790,78 @@ pick_dmg_asset() {
   printf '%s\n' "$u"
 }
 
+# Download-Links müssen auf Releases desselben GitHub-Besitzers zeigen. Ein umbenanntes Repo
+# desselben Besitzers ist erlaubt – so hält es auch der offizielle ArtCraft Launcher.
+release_url_ok() {  # $1 URL  $2 repo ("besitzer/name")
+  local rest re='^[A-Za-z0-9._-]+/releases/download/[^/]+/[^/]+$'
+  rest=${1#"https://github.com/${2%%/*}/"}
+  [[ $rest != "$1" ]] || return 1
+  case $rest in *..*|*%2[fFeE]*) return 1 ;; esac
+  [[ $rest =~ $re ]]
+}
+
 # Neueste Version abfragen. Setzt GH_TAG GH_VER GH_DMG_URL GH_DMG_NAME GH_SUMS_URL GH_NO_DMG
 gh_latest() {
-  local repo=$1 short=${1#*/} json urls eff
+  local repo=$1 json urls eff base names u
   GH_TAG=""; GH_VER=""; GH_DMG_URL=""; GH_DMG_NAME=""; GH_SUMS_URL=""; GH_NO_DMG=0
   json=$(gh_api "https://api.github.com/repos/$repo/releases/latest")
   if [[ -n $json ]]; then
     GH_TAG=$(json_values "$json" tag_name | head -n 1)
-    urls=$(json_values "$json" browser_download_url)
+    urls=$(json_values "$json" browser_download_url | while IFS= read -r u; do
+             release_url_ok "$u" "$repo" && printf '%s\n' "$u"
+           done)
     GH_DMG_URL=$(pick_dmg_asset "$urls")
     GH_SUMS_URL=$(printf '%s\n' "$urls" | grep -E '/SHA256SUMS(\.txt)?$' | head -n 1)
-    if [[ -n $GH_TAG && -z $GH_DMG_URL ]]; then GH_NO_DMG=1; fi
   fi
   if [[ -z $GH_TAG ]]; then
-    # Rückfallebene ohne API (z. B. bei API-Limit): Weiterleitung von /releases/latest
+    # Ohne API (z. B. Limit erreicht): Tag aus der Weiterleitung von /releases/latest und die
+    # Dateinamen aus SHA256SUMS.txt statt geraten – so übersteht das auch neue Namensschemata.
     eff=$(curl -fsSIL -o /dev/null -w '%{url_effective}' --max-time 30 \
       "https://github.com/$repo/releases/latest" 2>/dev/null)
     case $eff in
-      */releases/tag/*) GH_TAG=${eff##*/releases/tag/} ;;
+      "https://github.com/${repo%%/*}/"*/releases/tag/*)
+        GH_TAG=${eff##*/releases/tag/}; base=${eff%/releases/tag/*} ;;
     esac
     [[ -z $GH_TAG ]] && return 1
-    GH_VER=$(normalize_version "$GH_TAG")
-    GH_DMG_URL="https://github.com/$repo/releases/download/$GH_TAG/$short-$GH_VER-macos-universal.dmg"
-    GH_SUMS_URL="https://github.com/$repo/releases/download/$GH_TAG/SHA256SUMS.txt"
-    GH_NO_DMG=0
+    GH_SUMS_URL="$base/releases/download/$GH_TAG/SHA256SUMS.txt"
+    names=$(curl -fsSL --max-time 30 "$GH_SUMS_URL" 2>/dev/null \
+      | awk 'NF >= 2 { f = $2; sub(/^\*/, "", f); print f }')
+    if [[ -n $names ]]; then
+      GH_DMG_NAME=$(pick_dmg_asset "$names")    # leer = Release ohne macOS-DMG
+    else
+      GH_SUMS_URL=""                            # keine Prüfsummen-Datei: übliches Schema
+      GH_DMG_NAME="${repo#*/}-$(normalize_version "$GH_TAG")-macos-universal.dmg"
+    fi
+    [[ -n $GH_DMG_NAME ]] && GH_DMG_URL="$base/releases/download/$GH_TAG/$GH_DMG_NAME"
+    if [[ -n $GH_DMG_URL ]] && ! release_url_ok "$GH_DMG_URL" "$repo"; then GH_DMG_URL=""; fi
   fi
+  if [[ -n $GH_TAG && -z $GH_DMG_URL ]]; then GH_NO_DMG=1; fi
   GH_VER=$(normalize_version "$GH_TAG")
   GH_DMG_NAME=${GH_DMG_URL##*/}
   [[ -n $GH_VER ]]
 }
 
-# NAME.app in ORDNER finden, Groß-/Kleinschreibung egal
+# NAME.app in ORDNER finden, Groß-/Kleinschreibung egal.
+# nocasematch statt "tr" – sonst zwei Prozesse pro App in /Applications.
 find_app_ci() {
-  local dir=$1 want f base
-  want=$(lower "${2%.app}")
+  local dir=$1 want=${2%.app} f base rc=1
   [[ -d $dir ]] || return 1
+  shopt -s nocasematch
   for f in "$dir"/*.app; do
     [[ -d $f && ! -L $f ]] || continue
-    base=$(basename "$f" .app)
-    if [[ $(lower "$base") == "$want" ]]; then printf '%s\n' "$f"; return 0; fi
+    base=${f##*/}
+    if [[ ${base%.app} == "$want" ]]; then printf '%s\n' "$f"; rc=0; break; fi
   done
-  return 1
+  shopt -u nocasematch
+  return $rc
 }
 
 find_installed_app() {  # $1 repo  $2 App-Name-Vorgabe (oder leer)
   local repo=$1 override=$2 p d n
   local -a names
   p=$(state_get "$(gh_state_file "$repo")" app_path)
-  if [[ -n $p && -d $p ]]; then printf '%s\n' "$p"; return 0; fi
+  # Nur echte .app-Bundles: Der Pfad landet später in mv/rm -rf (Backup)
+  if [[ $p == *.app && -d $p && ! -L $p ]]; then printf '%s\n' "$p"; return 0; fi
   names=()
   [[ -n $override ]] && names+=("$override")
   names+=("${repo#*/}")
@@ -967,24 +902,46 @@ verify_checksum() {  # $1 Datei  $2 Dateiname  $3 URL der Prüfsummen  $4 Arbeit
   log "  Prüfsumme ok"
 }
 
-verify_app_signature() {  # $1 App  $2 erwartete Team-ID (leer = beliebig)
-  local team out
-  if ! out=$(codesign --verify --deep --strict "$1" 2>&1); then
+# Prüft die Kopie wie der offizielle ArtCraft Launcher, bevor sie etwas ersetzt:
+#  1. Signatur aller Teile intakt (--deep --strict, alle Architekturen)
+#  2. Developer-ID-Signatur genau dieses Teams mit genau dieser Bundle-ID
+#  3. von Apple notarisiert
+#  4. Gatekeeper akzeptiert sie – außer du hast Gatekeeper selbst ausgeschaltet
+verify_app_signature() {  # $1 App  $2 Team-ID  $3 Bundle-ID
+  local app=$1 team=$2 bid=$3 out req
+  case $team in ""|*[!A-Za-z0-9]*) err "  Keine gültige Team-ID zum Prüfen – nicht installiert"; return 1 ;; esac
+  case $bid in ""|*[!A-Za-z0-9._-]*) err "  Keine gültige Bundle-ID zum Prüfen – nicht installiert"; return 1 ;; esac
+  if ! out=$(run_with_timeout 120 codesign --verify --all-architectures --deep --strict "$app" 2>&1); then
     err "  Signatur ungültig: $out"; return 1
   fi
-  team=$(codesign_team "$1")
-  if [[ -n $2 && $team != "$2" ]]; then
-    err "  Unerwartete Team-ID \"$team\" (erwartet \"$2\") – abgebrochen"; return 1
+  req="=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists"
+  req="$req and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+  req="$req and certificate leaf[subject.OU] = \"$team\" and identifier \"$bid\""
+  if ! out=$(run_with_timeout 120 codesign --verify --all-architectures --strict -R "$req" "$app" 2>&1); then
+    err "  Nicht vom erwarteten Entwickler signiert (Team $team, $bid): $out"; return 1
   fi
-  if ! out=$(spctl --assess --type execute "$1" 2>&1); then
+  if ! out=$(run_with_timeout 120 codesign --verify --check-notarization -R=notarized "$app" 2>&1); then
+    err "  Nicht von Apple notarisiert: $out"; return 1
+  fi
+  if [[ $(spctl --status 2>&1) == "assessments disabled" ]]; then
+    note "  Gatekeeper ist ausgeschaltet – dessen Prüfung übersprungen"
+  elif ! out=$(run_with_timeout 120 spctl --assess --type execute --ignore-cache --no-cache "$app" 2>&1); then
     err "  Gatekeeper lehnt die App ab: $out"; return 1
   fi
-  log "  Signatur und Notarisierung ok (Team $team)"
+  log "  Signatur, Entwickler (Team $team) und Notarisierung ok"
 }
 
-dmg_attach() {  # $1 DMG  $2 Mountpunkt  (bestätigt evtl. Lizenzdialoge)
-  { yes 2>/dev/null || true; } | hdiutil attach "$1" -nobrowse -readonly -noautoopen -noverify \
-    -mountpoint "$2" >/dev/null 2>&1
+# DMG einhängen (bestätigt evtl. Lizenzdialoge). diskimages-helper lehnt ab, solange er mit
+# einem anderen Image beschäftigt ist – dann kurz warten und erneut versuchen.
+dmg_attach() {  # $1 DMG  $2 Mountpunkt
+  local wait
+  for wait in 0 1 2 4 8; do
+    sleep "$wait"
+    { yes 2>/dev/null || true; } | hdiutil attach "$1" -nobrowse -readonly -noautoopen -noverify \
+      -mountpoint "$2" >/dev/null 2>&1 && return 0
+    dmg_detach "$2"   # falls halb eingehängt
+  done
+  return 1
 }
 dmg_detach() {
   hdiutil detach "$1" -quiet >/dev/null 2>&1 || hdiutil detach "$1" -force -quiet >/dev/null 2>&1
@@ -1014,13 +971,12 @@ swap_app() {  # $1 neue App (Staging)  $2 Ziel  $3 alte App (oder leer)
     backup="$BACKUP_DIR/$(basename "$old").backup"
     rm -rf "$backup"
     if ! mv "$old" "$backup" 2>/dev/null; then
-      backup=""
-      if ! rm -rf "$old" 2>/dev/null; then
-        err "  Alte Version ließ sich weder verschieben noch löschen."
-        err "  Tipp: Systemeinstellungen › Datenschutz & Sicherheit › App-Verwaltung prüfen"
-        rm -rf "$new"
-        return 1
-      fi
+      # Kein rm -rf als Ersatz: Bricht das mittendrin ab, wäre die alte Version kaputt
+      # und die neue würde unten trotzdem verworfen.
+      err "  Alte Version ließ sich nicht verschieben – sie bleibt unverändert."
+      note "  Tipp: Systemeinstellungen › Datenschutz & Sicherheit › App-Verwaltung prüfen"
+      rm -rf "$new"
+      return 1
     fi
   fi
   if [[ -e $dest ]]; then
@@ -1093,17 +1049,35 @@ _github_install() {
       err "  $short: Bundle-ID passt nicht ($old_bid ≠ $new_bid) – abgebrochen"
       return 1
     fi
+  elif [[ ${repo%%/*} == storytold && $new_bid != ai.storyteller.* ]]; then
+    # Craft-Apps tragen ai.storyteller.<name> (so auch im Katalog des ArtCraft Launchers)
+    err "  $short: unerwartete Bundle-ID \"${new_bid:-?}\" – nicht installiert"
+    return 1
+  fi
+  # Die App im DMG muss die Version des Releases melden – kein älterer oder falscher Build
+  # unter neuem Tag (dieselbe Regel wie beim offiziellen Launcher)
+  if ! same_version "$(normalize_version "$new_raw")" "$GH_VER"; then
+    err "  $short: App im DMG meldet Version ${new_raw:-?} statt $GH_VER – nicht installiert"
+    return 1
   fi
 
-  # In den Staging-Ordner kopieren (gleiches Volume wie /Applications → schneller Tausch)
+  # In den Staging-Ordner kopieren (gleiches Volume wie /Applications → schneller Tausch).
+  # Ohne Resource Forks, erweiterte Attribute und ACLs: Das DMG-Volume hängt Finder-Infos an
+  # die Dateien, und dann lehnt "codesign --strict" die App als "detritus" ab. Die Signatur
+  # steckt in den Dateien selbst, nicht in diesen Attributen.
   mkdir -p "$STAGE_DIR"
   staged="$STAGE_DIR/$name"
   rm -rf "$staged"
-  if ! ditto "$src" "$staged"; then
+  if ! ditto --norsrc --noextattr --noacl "$src" "$staged"; then
     err "  $short: Kopieren aus dem DMG fehlgeschlagen"
     rm -rf "$staged"
     return 1
   fi
+  # Klont ditto innerhalb eines APFS-Volumes, hängen Finder-Infos trotz der Schalter noch dran
+  # (nachgestellt mit codesign). Darum diese zwei gezielt entfernen – andere Attribute wie
+  # com.apple.provenance setzt macOS selbst, die stören nicht.
+  xattr -dr com.apple.FinderInfo "$staged" 2>/dev/null
+  xattr -dr com.apple.ResourceFork "$staged" 2>/dev/null
   dmg_detach "$mnt"
   GH_MNT=""
 
@@ -1111,7 +1085,7 @@ _github_install() {
     want_team=""
     [[ -n $old ]] && want_team=$(codesign_team "$old")
     [[ -z $want_team ]] && want_team=$GITHUB_TEAM_ID
-    if ! verify_app_signature "$staged" "$want_team"; then
+    if ! verify_app_signature "$staged" "$want_team" "$new_bid"; then
       rm -rf "$staged"
       return 1
     fi
@@ -1156,6 +1130,14 @@ github_update_one() {
   [[ $entry == *"|"* ]] && override=${entry#*|}
   short=${repo#*/}
 
+  # Erst lokal nachsehen: Nicht gewünschte Apps brauchen keine GitHub-Abfrage
+  # (und erzeugen ohne Internet keine Fehler)
+  app=$(find_installed_app "$repo" "$override")
+  if [[ -z $app && $GITHUB_INSTALL_MISSING != yes ]]; then
+    note "$short: nicht installiert – übersprungen (GITHUB_INSTALL_MISSING=\"no\")"
+    return 0
+  fi
+
   if ! gh_latest "$repo"; then
     err "$short: neueste Version nicht abrufbar (GitHub nicht erreichbar oder Repo falsch?)"
     return 1
@@ -1165,18 +1147,13 @@ github_update_one() {
     return 20
   fi
 
-  app=$(find_installed_app "$repo" "$override")
   if [[ -z $app ]]; then
-    if [[ $GITHUB_INSTALL_MISSING != yes ]]; then
-      note "$short: nicht installiert – übersprungen (GITHUB_INSTALL_MISSING=\"no\")"
-      return 0
-    fi
     if [[ $RUN_MODE == check ]]; then
       info "$short: nicht installiert – $GH_VER wird beim nächsten Lauf installiert"
       return 30
     fi
     info "$short: nicht installiert – $GH_VER wird installiert"
-    github_install "$repo" "" "${APP_DIRS[0]}" "$override"
+    github_install "$repo" "" "$(new_app_dir)" "$override"
     return $?
   fi
 
@@ -1210,7 +1187,7 @@ github_update_one() {
 step_github() {
   local entry rc n_upd=0 n_def=0 n_err=0 n_avail=0
   local -a parts
-  section "1/4  Apps von GitHub"
+  section "1/3  Apps von GitHub"
   if [[ $UPDATE_GITHUB_APPS != yes ]]; then
     note "ausgeschaltet (UPDATE_GITHUB_APPS)"; SUM_GITHUB="ausgeschaltet"; return 0
   fi
@@ -1252,7 +1229,7 @@ run_quiet() {  # Ausgabe nur bei Fehler zeigen
 step_homebrew() {
   local brew outdated n rc
   local -a greedy
-  section "2/4  Homebrew"
+  section "2/3  Homebrew"
   if [[ $UPDATE_HOMEBREW != yes ]]; then
     note "ausgeschaltet (UPDATE_HOMEBREW)"; SUM_BREW="ausgeschaltet"; return 0
   fi
@@ -1268,7 +1245,13 @@ step_homebrew() {
   run_quiet "$brew" update || warn "brew update fehlgeschlagen – nutze die vorhandene Paketliste"
 
   outdated=$("$brew" outdated --verbose "${greedy[@]}" 2>/dev/null)
+  rc=$?
   if [[ -z $outdated ]]; then
+    # Leere Ausgabe nach einem Fehler heißt nicht "aktuell"
+    if (( rc != 0 )); then
+      err "brew outdated fehlgeschlagen (Code $rc) – Details: brew outdated"
+      SUM_BREW="Fehler"; return 0
+    fi
     ok "Alles aktuell"; SUM_BREW="aktuell"; return 0
   fi
   n=$(printf '%s\n' "$outdated" | grep -c .)
@@ -1293,9 +1276,46 @@ step_homebrew() {
 # ══════════════════════════════════════════════════════════════════════════════
 #  Schritt 3: App Store
 # ══════════════════════════════════════════════════════════════════════════════
+# Ist der App-Store-Helper eingerichtet und darf er ohne Passwort laufen?
+# "sudo -l" führt nichts aus, es fragt nur die Regel ab.
+store_helper_ready() {
+  [[ -x $STORE_HELPER && -x $STORE_MAS ]] && store_rule_active
+}
+
+# Steht die NOPASSWD-Regel für den Helper in der Liste von "sudo -l"? "sudo -l <befehl>" reicht
+# dafür nicht: Es sagt nur, ob der Befehl erlaubt ist (für Admins immer, dann eben mit Passwort),
+# und braucht selbst kein Passwort, sobald irgendeine NOPASSWD-Regel existiert (man sudoers).
+# -k: zwischengespeicherte Admin-Rechte nicht mitzählen.
+store_rule_active() {
+  sudo -k -n -l 2>/dev/null | grep -qE "NOPASSWD: $(regex_escape "$STORE_HELPER")( \"\")?[[:space:]]*\$"
+}
+
+# Das eigentliche mas-Programm. Homebrew legt ab mas 7 unter bin/mas einen zsh-Wrapper ab, das
+# Programm selbst liegt in libexec/bin/mas. Für "mas update" startet der Wrapper es nur (exec).
+# Die root-Kopie muss das Programm sein: Kopiert fände der Wrapper es nicht mehr, und ein Helper,
+# der in den Homebrew-Ordner zeigt (gehört dem Benutzer), gäbe jedem Programm des Benutzers root.
+mas_binary() {
+  local m
+  m=$(command -v mas 2>/dev/null) || return 1
+  m=$(resolve_path "$m")
+  if ! is_macho "$m" && [[ $m == */bin/mas ]]; then
+    m=$(resolve_path "${m%/bin/mas}/libexec/bin/mas")
+  fi
+  is_macho "$m" || return 1
+  printf '%s\n' "$m"
+}
+
+# Ist die root-eigene mas-Kopie noch dasselbe Programm wie das installierte mas?
+# (Ohne erkennbares mas-Programm gibt es nichts zu melden.)
+store_mas_current() {
+  local m
+  m=$(mas_binary) || return 0
+  [[ $(sha256_of "$m") == "$(sha256_of "$STORE_MAS")" ]]
+}
+
 step_appstore() {
-  local mas out list n
-  section "3/4  App Store"
+  local mas out list rc n
+  section "3/3  App Store"
   if [[ $UPDATE_APPSTORE != yes ]]; then
     note "ausgeschaltet (UPDATE_APPSTORE)"; SUM_MAS="ausgeschaltet"; return 0
   fi
@@ -1305,115 +1325,67 @@ step_appstore() {
     SUM_MAS="mas fehlt"; return 0
   fi
   out=$(run_with_timeout 300 "$mas" outdated 2>&1)
-  list=$(printf '%s\n' "$out" | grep -E '^[[:space:]]*[0-9]{6,}[[:space:]]')
+  rc=$?
+  # "497799835  Xcode  (16.0 -> 16.1)" → "Xcode (16.0 -> 16.1)"
+  list=$(printf '%s\n' "$out" | grep -E '^[[:space:]]*[0-9]{6,}[[:space:]]' \
+    | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]+//; s/[[:space:]]+/ /g; s/ $//')
   if [[ -z $list ]]; then
+    # Leere Liste nach Zeitlimit oder Fehler heißt nicht "aktuell"
+    if (( rc > 128 )); then
+      err "mas outdated: keine Antwort innerhalb von 5 Minuten"; SUM_MAS="Fehler"; return 0
+    elif (( rc != 0 )); then
+      warn "mas outdated meldete einen Fehler: $(printf '%s\n' "$out" | grep . | tail -n 1)"
+      SUM_MAS="unklar (Fehler bei mas outdated)"; return 0
+    fi
     ok "Alle App-Store-Apps sind aktuell"; SUM_MAS="aktuell"; return 0
   fi
   n=$(printf '%s\n' "$list" | grep -c .)
   info "$n Update(s) verfügbar:"
-  printf '%s\n' "$list" | sed 's/^[[:space:]]*/    /'
+  printf '%s\n' "$list" | sed 's/^/    /'
   if [[ $RUN_MODE == check ]]; then
     CHECK_FOUND=$((CHECK_FOUND + n)); SUM_MAS="$n verfügbar"; return 0
   fi
-  if [[ -x $HELPER_MAS && $(sha256_of "$(resolve_path "$mas")") != "$(sha256_of "$HELPER_MAS")" ]]; then
-    note "Neuere mas-Version erkannt – 'macupdate --install' übernimmt sie für die nächtlichen Läufe"
+  if ! store_helper_ready; then
+    warn "Automatische App-Store-Updates sind nicht eingerichtet – 'macupdate --install' (oder im App Store aktualisieren)"
+    SUM_MAS="$n verfügbar (nicht eingerichtet)"; return 0
   fi
-  if privileged mas-upgrade; then
-    ok "App-Store-Apps aktualisiert"; SUM_MAS="$n aktualisiert"; CHANGES+=("App Store: $n")
+  if ! store_mas_current; then
+    note "mas hat sich geändert (z. B. durch brew upgrade) – nachts läuft weiter die eingerichtete Kopie."
+    note "Übernehmen, falls du das Update erwartet hast: macupdate --install (zeigt Version und Prüfsumme)"
+  fi
+  log "mas update …"
+  if sudo -n "$STORE_HELPER"; then
+    ok "$n App-Store-App(s) aktualisiert"; SUM_MAS="$n aktualisiert"; CHANGES+=("App Store: $n")
   else
-    err "App-Store-Update fehlgeschlagen"; SUM_MAS="Fehler"
+    err "App-Store-Update fehlgeschlagen (Details oben)"; SUM_MAS="Fehler"
   fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Schritt 4: macOS
+#  macOS-Updates – erledigt macOS selbst; macupdate funkt nur nicht dazwischen
 # ══════════════════════════════════════════════════════════════════════════════
-step_macos() {
-  local cur raw items r m label title version scope=minor mode rtitles
-  local -a norestart restart majors parts
-  norestart=(); restart=(); majors=(); parts=()
-  section "4/4  macOS"
-  if [[ $UPDATE_MACOS != yes ]]; then
-    note "ausgeschaltet (UPDATE_MACOS)"; SUM_MACOS="ausgeschaltet"; return 0
-  fi
-  [[ $MACOS_MAJOR_UPGRADES == yes ]] && scope=all
-  cur=$(sw_vers -productVersion 2>/dev/null)
-  log "Installiert: macOS ${cur:-?} – suche Updates (kann etwas dauern) …"
-  raw=$(run_with_timeout 900 softwareupdate --list 2>&1)
-  items=$(printf '%s\n' "$raw" | su_parse_list "${cur%%.*}")
-  while IFS='|' read -r r m label title version; do
-    [[ -n $label ]] || continue
-    if [[ $m == 1 && $scope != all ]]; then majors+=("$title"); continue; fi
-    if [[ $r == 1 ]]; then restart+=("$title"); else norestart+=("$title"); fi
-  done <<< "$items"
+# Lädt, bereitet oder installiert macOS gerade ein Update? softwareupdated hält dann die
+# Energie-Assertion "SoftwareUpdateTask"; beim Vorbereiten läuft zusätzlich der
+# UpdateBrainService, bei Komplett-Installern osinstallersetupd oder startosinstall.
+macos_update_busy() {
+  local n
+  n=$(pmset -g assertions 2>/dev/null | awk '$1 == "SoftwareUpdateTask" { print $2; exit }')
+  if is_uint "$n" && (( n > 0 )); then return 0; fi
+  pgrep -f 'MobileSoftwareUpdate[.]UpdateBrainService|/osinstallersetupd|/startosinstall' >/dev/null 2>&1
+}
 
-  if (( ${#majors[@]} > 0 )); then
-    note "Nicht installiert (großes Upgrade, MACOS_MAJOR_UPGRADES=\"no\"): $(join_by ', ' "${majors[@]}")"
-  fi
-  if (( ${#norestart[@]} == 0 && ${#restart[@]} == 0 )); then
-    ok "macOS ist aktuell"; SUM_MACOS="aktuell"; return 0
-  fi
-  (( ${#norestart[@]} > 0 )) && info "Ohne Neustart: $(join_by ', ' "${norestart[@]}")"
-  (( ${#restart[@]} > 0 )) && info "Mit Neustart:  $(join_by ', ' "${restart[@]}")"
-  if [[ $RUN_MODE == check ]]; then
-    CHECK_FOUND=$((CHECK_FOUND + ${#norestart[@]} + ${#restart[@]}))
-    SUM_MACOS="$(( ${#norestart[@]} + ${#restart[@]} )) verfügbar"
-    return 0
-  fi
-
-  # a) Updates ohne Neustart gleich installieren
-  if (( ${#norestart[@]} > 0 )); then
-    if privileged macos-install "$scope" norestart; then
-      ok "Installiert: $(join_by ', ' "${norestart[@]}")"
-      parts+=("$(join_by ', ' "${norestart[@]}") installiert")
-      CHANGES+=("$(join_by ', ' "${norestart[@]}")")
-    else
-      err "Installation fehlgeschlagen: $(join_by ', ' "${norestart[@]}")"
-      parts+=("Fehler")
-    fi
-  fi
-
-  # b) Updates mit Neustart
-  if (( ${#restart[@]} == 0 )); then SUM_MACOS=$(join_by '; ' "${parts[@]}"); return 0; fi
-  rtitles=$(join_by ', ' "${restart[@]}")
-  case $MACOS_RESTART in
-    no)  mode=download ;;
-    yes) mode=restart ;;
-    *)
-      if [[ $INTERACTIVE == 1 ]]; then
-        if ask_yes_no "$rtitles jetzt installieren? Der Mac startet dabei neu." n; then mode=restart; else mode=download; fi
-      elif user_is_idle; then
-        mode=restart
-      elif ask_restart_dialog "Ein macOS-Update ist bereit: $rtitles. Zum Installieren muss der Mac neu starten. Ungesicherte Arbeit kann verloren gehen."; then
-        mode=restart
-      else
-        mode=download
-      fi
-      ;;
-  esac
-  # Apple Silicon: ohne hinterlegtes Passwort kann softwareupdate unbeaufsichtigt nicht installieren
-  if [[ $mode == restart && $INTERACTIVE != 1 ]] && is_arm && ! sudo -n "$HELPER" has-cred >/dev/null 2>&1; then
-    warn "Kein Passwort hinterlegt (nötig auf Apple-Silicon-Macs, siehe macupdate --install) – Update wird nur geladen"
-    mode=download
-  fi
-
-  if [[ $mode == download ]]; then
-    log "Lade $rtitles herunter …"
-    if privileged macos-install "$scope" download; then
-      ok "Heruntergeladen. Installieren: Systemeinstellungen › Allgemein › Softwareupdate"
-      parts+=("$rtitles geladen – Installation offen")
-      CHANGES+=("$rtitles geladen – bitte installieren")
-    else
-      err "Download fehlgeschlagen: $rtitles"
-      parts+=("Fehler")
-    fi
-  else
-    MACOS_PENDING=1
-    MACOS_SCOPE=$scope
-    parts+=("$rtitles – wird installiert, Neustart folgt")
-    CHANGES+=("$rtitles (Neustart)")
-  fi
-  SUM_MACOS=$(join_by '; ' "${parts[@]}")
+# Vor dem Lauf warten, bis macOS mit seinem Update fertig ist (höchstens 45 Minuten).
+# macupdate fasst keine Systemdateien an. Es soll aber nicht mitten in einem App-Austausch
+# vom Neustart des Updates unterbrochen werden und nicht um Leistung konkurrieren.
+wait_for_macos_update() {
+  local i
+  macos_update_busy || return 0
+  log "macOS ist gerade mit einem Update beschäftigt – warte, bis es fertig ist (höchstens 45 Minuten) …"
+  for (( i = 0; i < 45; i++ )); do
+    sleep 60
+    if ! macos_update_busy; then log "macOS-Update fertig – weiter"; return 0; fi
+  done
+  return 1
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1450,6 +1422,8 @@ run_cleanup() {
   release_lock
 }
 
+# Mac während des Laufs wach halten – endet von selbst mit dem Script. Hält dabei auch eine
+# Assertion, wegen der macOS einen Update-Neustart in der Regel aufschiebt.
 keep_awake() {
   command -v caffeinate >/dev/null 2>&1 || return 0
   caffeinate -ims -w $$ >/dev/null 2>&1 &
@@ -1458,10 +1432,13 @@ keep_awake() {
 finish() {
   local status body
   section "Zusammenfassung"
-  log "Craft-Apps:  ${SUM_GITHUB:-–}"
-  log "Homebrew:    ${SUM_BREW:-–}"
-  log "App Store:   ${SUM_MAS:-–}"
-  log "macOS:       ${SUM_MACOS:-–}"
+  if [[ -n $SKIP_REASON ]]; then
+    log "Lauf ausgelassen: $SKIP_REASON"
+  else
+    log "Craft-Apps:  ${SUM_GITHUB:-–}"
+    log "Homebrew:    ${SUM_BREW:-–}"
+    log "App Store:   ${SUM_MAS:-–}"
+  fi
 
   if [[ $RUN_MODE == check ]]; then
     echo
@@ -1475,25 +1452,26 @@ finish() {
     exit 0
   fi
 
-  if (( ERRORS > 0 )); then status="mit $ERRORS Fehler(n)"; else status="erfolgreich"; fi
+  if [[ -n $SKIP_REASON ]]; then
+    status="ausgelassen – $SKIP_REASON"
+  elif (( ERRORS > 0 )); then
+    status="mit $ERRORS Fehler(n)"
+  else
+    status="erfolgreich"
+  fi
   (( WARNINGS > 0 )) && status="$status, $WARNINGS Hinweis(e)"
   log "Fertig – $status. Protokoll: $LOG_FILE"
   write_last_run "$status" "$LOG_FILE"
   if [[ $RUN_MODE == scheduled ]]; then
-    if (( ${#CHANGES[@]} > 0 )); then body=$(join_by ', ' "${CHANGES[@]}"); else body="Alles aktuell"; fi
-    (( ERRORS > 0 )) && body="$ERRORS Fehler (macupdate -l) · $body"
+    # Bei Fehlern nie "Alles aktuell" melden (z. B. "1 Fehler · Alles aktuell" ohne Internet)
+    body=""
+    if [[ -n $SKIP_REASON ]]; then body="Lauf ausgelassen – $SKIP_REASON"
+    elif (( ${#CHANGES[@]} > 0 )); then body=$(join_by ', ' "${CHANGES[@]}")
+    elif (( ERRORS == 0 )); then body="Alles aktuell"; fi
+    (( ERRORS > 0 )) && body="$ERRORS Fehler (macupdate -l)${body:+ · $body}"
     notify "$body"
   fi
   cleanup_old_logs
-
-  if [[ $MACOS_PENDING == 1 ]]; then
-    log "Installiere das macOS-Update – der Mac startet danach automatisch neu …"
-    if ! privileged macos-install "$MACOS_SCOPE" restart; then
-      err "macOS-Update fehlgeschlagen"
-      write_last_run "macOS-Update fehlgeschlagen" "$LOG_FILE"
-      [[ $RUN_MODE == scheduled ]] && notify "macOS-Update fehlgeschlagen – Details: macupdate -l"
-    fi
-  fi
   [[ $RUN_MODE == manual ]] && sleep 0.3   # tee Zeit zum Schreiben lassen
   (( ERRORS > 0 )) && exit 1
   exit 0
@@ -1505,7 +1483,7 @@ cmd_run() {
   is_macos || die "macupdate läuft nur auf macOS."
   INTERACTIVE=0
   [[ $RUN_MODE != scheduled && -t 0 && -t 1 ]] && INTERACTIVE=1
-  ERRORS=0; WARNINGS=0; CHECK_FOUND=0; MACOS_PENDING=0; CHANGES=()
+  ERRORS=0; WARNINGS=0; CHECK_FOUND=0; SKIP_REASON=""; CHANGES=()
 
   mkdir -p "$STATE_DIR" "$LOG_DIR" "$CONFIG_DIR"
   [[ -f $SETTINGS_FILE ]] || write_default_settings
@@ -1556,10 +1534,14 @@ cmd_run() {
     err "Keine Internetverbindung – Lauf abgebrochen"
     finish
   fi
+  # Nicht neben einem laufenden macOS-Update installieren (Prüfen geht immer)
+  if [[ $RUN_MODE != check ]] && ! wait_for_macos_update; then
+    SKIP_REASON="macOS installiert gerade ein Update – nächster Versuch beim nächsten Lauf"
+    finish
+  fi
   step_github
   step_homebrew
   step_appstore
-  step_macos
   finish
 }
 
@@ -1570,7 +1552,7 @@ cmd_help() {
   local t="03:00"
   if [[ -f $SETTINGS_FILE ]] && load_settings 2>/dev/null; then t=$UPDATE_TIME; fi
   cat <<EOF_HELP
-macupdate $MACUPDATE_VERSION – nächtliche Updates für Craft-Apps, Homebrew, App Store und macOS
+macupdate $MACUPDATE_VERSION – nächtliche Updates für Craft-Apps, Homebrew und App Store
 
 Benutzung:  macupdate <Option>
 
@@ -1584,10 +1566,11 @@ Benutzung:  macupdate <Option>
   -v, --version     Versionsnummer anzeigen
   -h, --help        Diese Hilfe
 
-      --install     Einrichten oder aktualisieren (braucht dein Admin-Passwort)
+      --install     Einrichten oder aktualisieren
       --uninstall   Alles wieder entfernen
 
-Ablauf:  1. Craft-Apps (GitHub)  →  2. Homebrew  →  3. App Store  →  4. macOS
+Ablauf:  1. Craft-Apps (GitHub)  →  2. Homebrew  →  3. App Store
+macOS-Updates erledigt macOS selbst; macupdate wartet, solange eins läuft.
 Automatisch täglich um $t  ·  Einstellungen: ~/.config/macupdate/settings.conf
 EOF_HELP
 }
@@ -1612,9 +1595,16 @@ cmd_unskip() {
 
 cmd_edit() {
   local ed
+  trap drop_root EXIT
   mkdir -p "$CONFIG_DIR" "$STATE_DIR"
   [[ -f $SETTINGS_FILE ]] || write_default_settings
-  ed=$(sed -n 's/^SETTINGS_EDITOR="\(.*\)"[[:space:]]*$/\1/p' "$SETTINGS_FILE" | tail -n 1)
+  # Gültige Datei: Wert wie jede andere Einstellung lesen ('…', Kommentar dahinter usw.).
+  # Sonst die Zeile direkt suchen, damit sich eine kaputte Datei trotzdem öffnen lässt.
+  if load_settings >/dev/null 2>&1; then
+    ed=$SETTINGS_EDITOR
+  else
+    ed=$(sed -n 's/^SETTINGS_EDITOR="\(.*\)"[[:space:]]*$/\1/p' "$SETTINGS_FILE" | tail -n 1)
+  fi
   [[ -z $ed ]] && ed=${VISUAL:-${EDITOR:-nano}}
   while true; do
     open_in_editor "$ed" "$SETTINGS_FILE"
@@ -1624,19 +1614,19 @@ cmd_edit() {
       return 1
     fi
   done
-  apply_schedule
+  apply_schedule --wake
   printf '✓ Einstellungen gespeichert. Nächster Lauf: %s\n' "$(fmt_de "$(next_run_epoch)")"
 }
 
 cmd_status() {
-  local valid=1 when what logf
+  local valid=1 when what logf want have m
   mkdir -p "$STATE_DIR"
   [[ -f $SETTINGS_FILE ]] || write_default_settings
   load_settings || valid=0
   echo "macupdate $MACUPDATE_VERSION"
   echo
   if [[ $valid == 1 ]]; then
-    apply_schedule | sed 's/^/  /'
+    apply_schedule --no-hint | sed 's/^/  /'
   else
     echo "  ⚠ Einstellungen fehlerhaft – nächtliche Läufe brechen ab (macupdate -e)"
   fi
@@ -1654,10 +1644,16 @@ cmd_status() {
   else
     echo "  Zeitplan:        nicht eingerichtet – bitte einmal 'bash macupdate --install' ausführen"
   fi
-  if [[ $WAKE_MAC == yes ]]; then
-    printf '  Mac wecken:      ja, um %s\n' "$(wake_time_for "$UPDATE_TIME")"
-  else
+  want=$(wake_wanted)
+  have=$(wake_applied)
+  if [[ $want == "$have" && $want == off ]]; then
     echo "  Mac wecken:      nein"
+  elif [[ $want == "$have" ]]; then
+    printf '  Mac wecken:      ja, um %s\n' "$want"
+  elif [[ $want == off ]]; then
+    printf '  Mac wecken:      nein – aber noch um %s eingestellt (macupdate -e)\n' "$have"
+  else
+    printf '  Mac wecken:      um %s gewünscht – noch nicht eingestellt (macupdate -e)\n' "$want"
   fi
   if [[ -f $LAST_RUN_FILE ]]; then
     IFS='|' read -r when what logf < "$LAST_RUN_FILE"
@@ -1665,22 +1661,25 @@ cmd_status() {
   else
     echo "  Letzter Lauf:    noch keiner"
   fi
-  if sudo -n "$HELPER" ping >/dev/null 2>&1; then
-    echo "  Root-Helper:     ok"
+  m=$(command -v mas 2>/dev/null)
+  if [[ $UPDATE_APPSTORE != yes ]]; then
+    echo "  App Store:       ausgeschaltet (UPDATE_APPSTORE)"
+  elif [[ -z $m ]]; then
+    echo "  App Store:       mas fehlt (brew install mas, danach macupdate --install)"
+  elif ! store_helper_ready; then
+    echo "  App Store:       nur prüfen – automatisch einrichten: macupdate --install"
+  elif ! store_mas_current; then
+    echo "  App Store:       automatisch – mas hat sich geändert; übernehmen, falls erwartet: macupdate --install"
   else
-    echo "  Root-Helper:     fehlt – App-Store- und macOS-Schritt brauchen 'macupdate --install'"
+    printf '  App Store:       automatisch (mas %s)\n' "$(mas version 2>/dev/null | head -n 1)"
   fi
-  if is_arm; then
-    if sudo -n "$HELPER" has-cred >/dev/null 2>&1; then
-      echo "  macOS-Passwort:  hinterlegt (Systemupdates laufen vollautomatisch)"
-    else
-      echo "  macOS-Passwort:  nicht hinterlegt (Systemupdates werden nur heruntergeladen)"
-    fi
-  fi
-  if command -v mas >/dev/null 2>&1; then
-    printf '  mas:             %s\n' "$(mas version 2>/dev/null | head -n 1)"
+  if macos_update_busy; then
+    echo "  macOS-Update:    läuft gerade – macupdate wartet damit"
   else
-    echo "  mas:             nicht installiert (App-Store-Schritt wird übersprungen)"
+    echo "  macOS-Update:    keins aktiv (erledigt macOS selbst)"
+  fi
+  if [[ -n $(legacy_files) ]]; then
+    echo "  ⚠ Reste von macupdate 1.x (Root-Helper, sudo-Regel, Passwort) – 'macupdate --install' entfernt sie"
   fi
   printf '  Einstellungen:   %s\n' "$SETTINGS_FILE"
   printf '  Protokolle:      %s\n' "$LOG_DIR"
@@ -1698,43 +1697,223 @@ cmd_log() {
 }
 
 # ── Einrichten ────────────────────────────────────────────────────────────────
-start_sudo_keepalive() {
-  ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) >/dev/null 2>&1 &
-  SUDO_KEEPALIVE_PID=$!
-}
-stop_sudo_keepalive() {
-  [[ -n $SUDO_KEEPALIVE_PID ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
-  SUDO_KEEPALIVE_PID=""
-  return 0
-}
-
-# Verzeichnis gehört root und ist nur für root beschreibbar?
-dir_is_safe() {
-  local line perms owner
-  line=$(ls -ld "$1" 2>/dev/null) || return 1
-  perms=$(printf '%s' "$line" | awk '{print $1}')
-  owner=$(printf '%s' "$line" | awk '{print $3}')
-  [[ $owner == root ]] || return 1
-  case $perms in
-    ?????w*|????????w*) return 1 ;;
-  esac
-  return 0
-}
-
-sudo_install_file() {  # $1 Quelle  $2 Ziel  $3 Rechte
-  sudo install -m "$3" -o root -g wheel "$1" "$2.new" &&
-    { sudo xattr -c "$2.new" 2>/dev/null; true; } &&
-    sudo mv -f "$2.new" "$2"
-}
-
-install_mas_copy() {
-  local m
-  m=$(resolve_path "$(command -v mas)")
-  if ! file -b "$m" 2>/dev/null | grep -q 'Mach-O'; then
-    echo "  ⚠ $m ist kein ausführbares Programm – App-Store-Schritt braucht mas 4.1 oder neuer"
+# Befehl mit Admin-Rechten. Sagt beim ersten Mal, warum macOS nach Passwort/Touch ID fragt.
+as_root() {
+  if ! is_admin; then
+    echo "✗ \"$USER\" ist kein Administrator – dieser Schritt braucht Admin-Rechte." >&2
     return 1
   fi
-  sudo_install_file "$m" "$HELPER_MAS" 755
+  if [[ $ROOT_HINT_SHOWN == 0 ]] && ! sudo -n true 2>/dev/null; then
+    echo "  macOS fragt jetzt nach deinem Passwort (oder Touch ID):" >&2
+  fi
+  ROOT_HINT_SHOWN=1
+  ROOT_USED=1
+  sudo "$@"
+}
+
+# Admin-Rechte gleich wieder abgeben. Sonst bliebe das sudo-Ticket noch einige Minuten gültig,
+# und jedes Programm in diesem Terminal könnte so lange sudo ohne Passwort nutzen.
+drop_root() {
+  [[ $ROOT_USED == 1 ]] && sudo -k 2>/dev/null
+  return 0
+}
+
+# Braucht das Anlegen/Löschen der Datei $1 Admin-Rechte? (nächster vorhandener
+# Ordner nicht beschreibbar)
+needs_root_for() {
+  local d
+  d=$(dirname "$1")
+  while [[ ! -d $d ]]; do d=$(dirname "$d"); done
+  [[ ! -w $d ]]
+}
+
+# Befehl nach $INSTALL_BIN kopieren (über .new, damit dort nie eine halbe Datei liegt)
+install_command() {
+  local src=$1 run=""
+  [[ $(resolve_path "$src") == "$(resolve_path "$INSTALL_BIN")" ]] && return 0
+  needs_root_for "$INSTALL_BIN" && run=as_root
+  $run mkdir -p "$(dirname "$INSTALL_BIN")" &&
+    $run install -m 755 "$src" "$INSTALL_BIN.new" &&
+    { $run xattr -c "$INSTALL_BIN.new" 2>/dev/null; true; } &&
+    $run mv -f "$INSTALL_BIN.new" "$INSTALL_BIN"
+}
+
+# Ordner gehört root und ist für niemanden sonst beschreibbar, auch nicht über eine ACL?
+# (In automatischen Tests gehört die Sandbox dem aktuellen Benutzer.)
+dir_is_safe() {
+  local want=root line perms owner
+  [[ -n $_R ]] && want=$(id -un)
+  line=$(ls -ld "$1" 2>/dev/null) || return 1
+  perms=${line%% *}
+  owner=$(printf '%s\n' "$line" | awk '{ print $3 }')
+  [[ $owner == "$want" ]] || return 1
+  case $perms in ?????w*|????????w*) return 1 ;; esac
+  # ACL-Einträge zeigt "ls -le" als weitere Zeilen. Das "+" hinter den Rechten reicht nicht:
+  # Hat der Ordner auch erweiterte Attribute, zeigt ls dort nur "@".
+  [[ $(ls -led "$1" 2>/dev/null | wc -l) -le 1 ]]
+}
+
+# Vorhandene Reste von macupdate 1.x (eine Datei pro Zeile)
+legacy_files() {
+  local f
+  for f in "${LEGACY_ROOT_FILES[@]}"; do [[ -e $f ]] && printf '%s\n' "$f"; done
+  return 0
+}
+
+remove_legacy() {
+  local f
+  local -a found
+  found=()
+  while IFS= read -r f; do [[ -n $f ]] && found+=("$f"); done <<< "$(legacy_files)"
+  (( ${#found[@]} == 0 )) && return 0
+  if as_root rm -f "${found[@]}"; then
+    echo "✓ Alte Einrichtung entfernt: Root-Helper, sudo-Regel und ein evtl. gespeichertes Passwort"
+  else
+    echo "⚠ Alte Einrichtung ließ sich nicht vollständig entfernen:"
+    printf '    %s\n' "${found[@]}"
+    return 1
+  fi
+}
+
+store_files_present() {
+  local f
+  for f in "${STORE_FILES[@]}"; do [[ -e $f ]] && return 0; done
+  return 1
+}
+
+# Der App-Store-Helper als Text. Er nimmt keine Argumente, läuft nur als root über sudo und
+# startet nur die root-eigene mas-Kopie mit "update". run_with_timeout kommt wortgleich aus
+# diesem Script (declare -f), statt doppelt gepflegt zu werden.
+build_store_helper() {
+  local hp="/usr/bin:/bin:/usr/sbin:/sbin"
+  # Nur in automatischen Tests (MACUPDATE_TEST_ROOT gesetzt) zeigt der PATH auf Attrappen.
+  [[ -n $_TP ]] && hp="$_TP:$hp"
+  cat <<'EOF_H1'
+#!/bin/bash
+#
+#  macupdate – App-Store-Helper
+#  Aktualisiert alle App-Store-Apps ("mas update"); mas verlangt dafür root.
+#  Darf per sudo ohne Passwort laufen – aber nur ohne Argumente
+#  (Regel: /etc/sudoers.d/macupdate-appstore). Sonst kann er nichts.
+#  Erzeugt von "macupdate --install" – bitte nicht von Hand bearbeiten.
+#
+EOF_H1
+  printf 'PATH=%q\nexport PATH\nMAS_BIN=%q\n' "$hp" "$STORE_MAS"
+  cat <<'EOF_H2'
+umask 022
+die() { echo "macupdate-appstore: $*" >&2; exit 2; }
+[[ $EUID -eq 0 ]] || die "muss als root laufen"
+[[ $# -eq 0 ]] || die "nimmt keine Argumente"
+case ${SUDO_USER:-} in
+  ""|root) die "nur über sudo aus macupdate heraus aufrufen" ;;
+  *[!A-Za-z0-9._-]*) die "ungültiger Benutzername" ;;
+esac
+[[ -x $MAS_BIN ]] || die "mas fehlt – bitte 'macupdate --install' ausführen"
+EOF_H2
+  declare -f run_with_timeout
+  printf '%s\n' 'run_with_timeout 7200 "$MAS_BIN" update'
+}
+
+# Welches mas-Programm startet der Helper künftig als root? Setzt STORE_MAS_SRC:
+#   Pfad = dieses Programm root-eigen kopieren,  leer = vorhandene Kopie behalten.
+# Rückgabe 1 = nichts Brauchbares (kein Programm, keine Kopie – oder abgelehnt ohne Kopie).
+# Das Programm liegt meist im Homebrew-Ordner, den jedes Programm des Benutzers ändern kann, und
+# ist nur adhoc signiert – seine Echtheit lässt sich nicht prüfen. Darum vor jedem Wechsel Pfad,
+# Version und Prüfsumme zeigen und fragen, statt still zu übernehmen. Bei einer Änderung ist
+# "nein" die Vorgabe: Ohne Antwort bleibt die bisherige Kopie.
+choose_store_mas() {
+  local m sum ver def=j
+  STORE_MAS_SRC=""
+  if ! m=$(mas_binary); then
+    echo "⚠ Kein ausführbares mas-Programm gefunden – App Store bleibt bei \"nur prüfen\""
+    [[ -x $STORE_MAS ]] && return 0   # die vorhandene Kopie bleibt nutzbar
+    return 1
+  fi
+  sum=$(sha256_of "$m")
+  [[ -x $STORE_MAS && $sum == "$(sha256_of "$STORE_MAS")" ]] && return 0   # schon übernommen
+  ver=$("$m" version 2>/dev/null | head -n 1)
+  echo
+  if [[ -x $STORE_MAS ]]; then
+    def=n
+    echo "mas hat sich seit der Einrichtung geändert. Künftig liefe nachts als root:"
+  else
+    echo "Dieses mas-Programm läuft künftig nachts als root:"
+  fi
+  printf '  %s\n  Version %s · SHA-256 %s\n' "$m" "${ver:-?}" "$sum"
+  echo "  Nur übernehmen, wenn du mas selbst installiert oder aktualisiert hast (z. B. brew upgrade)."
+  if ask_yes_no "Übernehmen?" "$def"; then
+    STORE_MAS_SRC=$m
+  elif [[ -x $STORE_MAS ]]; then
+    echo "  Die bisherige mas-Kopie bleibt."
+  else
+    return 1
+  fi
+  return 0
+}
+
+# App-Store-Helper einrichten: root-eigene Kopie von mas, Helper und eine sudo-Regel, die NUR
+# diesen Helper ohne Argumente und ohne Passwort erlaubt. Jeder Teil wird erst geprüft, dann
+# aktiviert – ein fehlerhafter Teil ersetzt nie einen funktionierenden. Kein Passwort wird
+# gespeichert: Selbst verschlüsselt müsste der Schlüssel für den nächtlichen Lauf greifbar
+# sein, und ein Passwort öffnet alles – diese Regel nur "mas update".
+#   $1 = mas-Programm für die root-Kopie (von choose_store_mas); leer = vorhandene Kopie behalten
+install_store_helper() {
+  local m=$1 rule
+  if [[ -n $m ]] && ! is_macho "$m"; then
+    echo "⚠ $m ist kein ausführbares Programm – App Store bleibt bei \"nur prüfen\""; return 1
+  fi
+  if [[ -z $m && ! -x $STORE_MAS ]]; then
+    echo "⚠ Keine mas-Kopie vorhanden – App Store bleibt bei \"nur prüfen\""; return 1
+  fi
+  as_root mkdir -p "$HELPER_DIR" "$(dirname "$STORE_SUDOERS")" || return 1
+  if ! dir_is_safe "$HELPER_DIR"; then
+    echo "⚠ $HELPER_DIR gehört nicht root oder ist für andere beschreibbar – Helper nicht eingerichtet"
+    return 1
+  fi
+  if [[ -n $m ]] && ! { as_root install -m 755 -o root -g wheel "$m" "$STORE_MAS.new" &&
+                        as_root mv -f "$STORE_MAS.new" "$STORE_MAS"; }; then
+    echo "⚠ mas ließ sich nicht kopieren"; return 1
+  fi
+  if ! build_store_helper | as_root tee "$STORE_HELPER.new" >/dev/null; then
+    echo "⚠ Helper ließ sich nicht schreiben"; return 1
+  fi
+  if ! bash -n "$STORE_HELPER.new"; then
+    as_root rm -f "$STORE_HELPER.new"; echo "⚠ Helper fehlerhaft – bitte melden"; return 1
+  fi
+  if ! { as_root chown root:wheel "$STORE_HELPER.new" && as_root chmod 755 "$STORE_HELPER.new" &&
+         as_root mv -f "$STORE_HELPER.new" "$STORE_HELPER"; }; then
+    echo "⚠ Helper ließ sich nicht einrichten"; return 1
+  fi
+  # "" am Ende = nur ohne Argumente. Der Dateiname hat keinen Punkt (sonst liest sudo ihn
+  # nicht); die .tmp-Datei ignoriert sudo, bis visudo sie geprüft hat.
+  rule="$USER ALL=(root) NOPASSWD: $STORE_HELPER \"\""
+  if ! printf '# macupdate: erlaubt NUR den App-Store-Helper, ohne Argumente und ohne Passwort.\n%s\n' "$rule" \
+       | as_root tee "$STORE_SUDOERS.tmp" >/dev/null; then
+    echo "⚠ sudo-Regel ließ sich nicht schreiben"; return 1
+  fi
+  if ! as_root visudo -cf "$STORE_SUDOERS.tmp" >/dev/null 2>&1; then
+    as_root rm -f "$STORE_SUDOERS.tmp"; echo "⚠ sudo-Regel von visudo abgelehnt – nichts geändert"; return 1
+  fi
+  if ! { as_root chown root:wheel "$STORE_SUDOERS.tmp" && as_root chmod 440 "$STORE_SUDOERS.tmp" &&
+         as_root mv -f "$STORE_SUDOERS.tmp" "$STORE_SUDOERS"; }; then
+    echo "⚠ sudo-Regel ließ sich nicht aktivieren"; return 1
+  fi
+  # -k: ohne die gerade eingegebenen Admin-Rechte – greift die Regel wirklich ohne Passwort?
+  if store_rule_active; then
+    echo "✓ App Store: automatische Updates eingerichtet (der Helper kann nur \"mas update\")"
+  else
+    echo "⚠ Die sudo-Regel greift nicht. Prüfe, ob /etc/sudoers die Zeile"
+    echo "  '#includedir /private/etc/sudoers.d' enthält."
+    return 1
+  fi
+}
+
+remove_store_helper() {
+  store_files_present || return 0
+  # Erst die Regel, dann der Helper, auf den sie zeigt
+  as_root rm -f "$STORE_SUDOERS" "$STORE_SUDOERS.tmp" &&
+    as_root rm -f "$STORE_HELPER" "$STORE_HELPER.new" "$STORE_MAS" "$STORE_MAS.new" &&
+    echo "✓ App-Store-Helper und seine sudo-Regel entfernt"
 }
 
 check_missing_apps() {
@@ -1750,58 +1929,18 @@ check_missing_apps() {
   (( ${#missing[@]} == 0 )) && return 0
   echo
   echo "Noch nicht installiert: $(join_by ', ' "${missing[@]}")"
-  if ask_yes_no "Fehlende Apps beim nächsten Lauf nach /Applications installieren?" j; then
+  if ask_yes_no "Fehlende Apps beim nächsten Lauf installieren?" j; then
     settings_set GITHUB_INSTALL_MISSING yes; GITHUB_INSTALL_MISSING=yes
   else
     settings_set GITHUB_INSTALL_MISSING no; GITHUB_INSTALL_MISSING=no
   fi
 }
 
-setup_arm_credential() {
-  local pw=""
-  cat <<'EOF_CRED'
-
-macOS-Updates auf Apple-Silicon-Macs
-  softwareupdate installiert Systemupdates hier nur mit dem Passwort eines
-  "Volume-Eigentümers" – normalerweise dein Anmeldepasswort. Ohne Passwort
-  lädt macupdate Systemupdates nur herunter und du startest die Installation
-  selbst (Systemeinstellungen › Allgemein › Softwareupdate).
-  Wenn du zustimmst, wird das Passwort in einer Datei gespeichert, die nur
-  root lesen kann. Wer root-Rechte hat, kann es lesen – das ist der Preis
-  für die vollautomatische Installation.
-EOF_CRED
-  if sudo test -s "$HELPER_CRED"; then
-    ask_yes_no "Ein Passwort ist schon hinterlegt. Behalten?" j && return 0
-    sudo rm -f "$HELPER_CRED"
-  fi
-  ask_yes_no "Passwort für automatische macOS-Updates speichern?" n || return 0
-  printf 'Anmeldepasswort für %s: ' "$USER"
-  # IFS= : Leerzeichen am Anfang/Ende des Passworts nicht abschneiden
-  IFS= read -r -s pw </dev/tty
-  echo
-  if [[ -z $pw ]]; then echo "  Kein Passwort eingegeben – übersprungen."; return 0; fi
-  if ! printf '%s\n' "$pw" | sudo -S -k -v -p '' 2>/dev/null; then
-    pw=""
-    echo "  ✗ Passwort falsch – nicht gespeichert."
-    return 1
-  fi
-  if printf '%s\n' "$pw" | sudo /bin/sh -c 'umask 077 && cat > "$1"' sh "$HELPER_CRED.new" &&
-     sudo chown root:wheel "$HELPER_CRED.new" && sudo mv -f "$HELPER_CRED.new" "$HELPER_CRED"; then
-    echo "  ✓ Gespeichert (nur für root lesbar)"
-  else
-    echo "  ✗ Speichern fehlgeschlagen"
-  fi
-  pw=""
-  if sysadminctl -secureTokenStatus "$USER" 2>&1 | grep -qi 'DISABLED'; then
-    echo "  ⚠ $USER hat kein Secure Token – softwareupdate könnte das Passwort ablehnen."
-  fi
-}
-
 cmd_install() {
-  local src t brew rule wdef h m cred_state wake_txt
+  local src t brew h m wdef obsolete wake_txt store_txt copy=1 need_root=0 store=0
+  trap drop_root EXIT
   is_macos || die "macupdate läuft nur auf macOS."
   [[ $EUID -eq 0 && -z $_R ]] && die "Bitte ohne sudo starten:  bash macupdate --install"
-  is_admin || die "Dein Benutzer \"$USER\" ist kein Administrator – das ist für die Einrichtung nötig."
   case $USER in ""|*[!A-Za-z0-9._-]*) die "Benutzername \"$USER\" wird nicht unterstützt." ;; esac
   src=$(self_path)
   [[ -f $src ]] || die "Script-Datei nicht gefunden ($src)."
@@ -1815,94 +1954,67 @@ macupdate $MACUPDATE_VERSION – Einrichtung
 Das wird eingerichtet:
   • $INSTALL_BIN
       der Befehl "macupdate"
-  • $HELPER
-      kleiner Root-Helper für softwareupdate, mas und pmset
-  • $SUDOERS_FILE
-      erlaubt NUR diesem Helper, ohne Passwort zu laufen
   • ~/Library/LaunchAgents/$AGENT_LABEL.plist
-      der tägliche Zeitplan
+      der tägliche Zeitplan – läuft als du
   • $SETTINGS_FILE
       deine Einstellungen (bleiben bei erneuter Einrichtung erhalten)
+  • auf Wunsch der App-Store-Helper ($STORE_HELPER)
+      darf per sudo ohne Passwort laufen – aber nur "mas update", ohne Argumente.
+      Ein Passwort wird nirgends gespeichert.
 
-Dafür wird einmal dein Admin-Passwort gebraucht.
+macOS-Updates erledigt macOS selbst; macupdate wartet, solange eins läuft.
+Admin-Rechte (Passwort oder Touch ID) braucht nur dieses Einrichten.
 EOF_INTRO
+  if [[ -n $(legacy_files) ]]; then
+    echo
+    echo "Gefunden: Einrichtung von macupdate 1.x mit Root-Helper, sudo-Regel und"
+    echo "evtl. gespeichertem Passwort – sie wird dabei entfernt."
+  fi
+  echo
   ask_yes_no "Fortfahren?" j || exit 1
   echo
-  sudo -v || die "sudo fehlgeschlagen."
-  start_sudo_keepalive
-  trap stop_sudo_keepalive EXIT
 
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
   [[ -f $SETTINGS_FILE ]] || write_default_settings
   load_settings || die "Bitte zuerst die Einstellungen korrigieren: $SETTINGS_FILE"
+  obsolete=$(grep -o -E '^(MACOS_RESTART|MACOS_MAJOR_UPGRADES|UPDATE_MACOS)=' "$SETTINGS_FILE" | tr -d '=' | tr '\n' ' ')
+  if [[ -n $obsolete ]]; then
+    echo "Hinweis: Diese Einstellungen werden nicht mehr gebraucht und ignoriert: ${obsolete% }"
+    echo
+  fi
 
   # 1) Uhrzeit
   printf 'Uhrzeit für den täglichen Lauf [%s]: ' "$UPDATE_TIME"
-  read -r t </dev/tty
+  t=""
+  read -r t 2>/dev/null </dev/tty || echo
   if [[ -n $t ]]; then
     t=$(normalize_time "$t") || die "Ungültige Uhrzeit."
     settings_set UPDATE_TIME "$t"
     UPDATE_TIME=$t
   fi
 
-  # 2) Befehl installieren
-  sudo mkdir -p "$(dirname "$INSTALL_BIN")" || die "Konnte $(dirname "$INSTALL_BIN") nicht anlegen."
-  if [[ $(resolve_path "$src") != "$(resolve_path "$INSTALL_BIN")" ]]; then
-    sudo_install_file "$src" "$INSTALL_BIN" 755 || die "Konnte $INSTALL_BIN nicht schreiben."
-  fi
-  echo "✓ Befehl installiert: $INSTALL_BIN"
-
-  # 3) Root-Helper
-  sudo mkdir -p "$HELPER_DIR" || die "Konnte $HELPER_DIR nicht anlegen."
-  dir_is_safe "$HELPER_DIR" || die "$HELPER_DIR gehört nicht root oder ist für andere beschreibbar – abgebrochen."
-  build_helper | sudo tee "$HELPER.new" >/dev/null || die "Konnte den Helper nicht schreiben."
-  # Erst prüfen, dann aktivieren – ein fehlerhafter Helper ersetzt so nie den funktionierenden
-  if ! bash -n "$HELPER.new"; then
-    sudo rm -f "$HELPER.new"
-    die "Helper fehlerhaft – bitte melden."
-  fi
-  sudo chown root:wheel "$HELPER.new" && sudo chmod 755 "$HELPER.new" && sudo mv -f "$HELPER.new" "$HELPER" \
-    || die "Konnte den Helper nicht einrichten."
-  echo "✓ Root-Helper installiert"
-
-  # 4) mas für den App Store
-  brew=$(find_brew)
-  if ! command -v mas >/dev/null 2>&1; then
-    if [[ -n $brew ]] && ask_yes_no "Für App-Store-Updates wird \"mas\" gebraucht. Jetzt mit Homebrew installieren?" j; then
+  # 2) App Store: mas (braucht keine Admin-Rechte) und der Helper für "mas update"
+  if [[ $UPDATE_APPSTORE == yes ]]; then
+    brew=$(find_brew)
+    if ! command -v mas >/dev/null 2>&1 && [[ -n $brew ]] &&
+       ask_yes_no "Für App-Store-Updates wird \"mas\" gebraucht. Jetzt mit Homebrew installieren?" j; then
       "$brew" install mas || echo "⚠ mas-Installation fehlgeschlagen – der App-Store-Schritt wird übersprungen."
     fi
-  elif [[ -n $brew ]] && "$brew" list mas >/dev/null 2>&1; then
-    "$brew" upgrade mas >/dev/null 2>&1
-  fi
-  if command -v mas >/dev/null 2>&1 && install_mas_copy; then
-    echo "✓ mas für nächtliche App-Store-Updates eingerichtet"
-  fi
-
-  # 5) sudo-Regel – vor dem Aktivieren mit visudo prüfen
-  rule="$USER ALL=(root) NOPASSWD: $HELPER"
-  sudo mkdir -p "$(dirname "$SUDOERS_FILE")"
-  printf '# macupdate: erlaubt dem nächtlichen Lauf, den Root-Helper ohne Passwort zu starten.\n%s\n' "$rule" \
-    | sudo tee "$SUDOERS_FILE.tmp" >/dev/null
-  if ! sudo visudo -cf "$SUDOERS_FILE.tmp" >/dev/null 2>&1; then
-    sudo rm -f "$SUDOERS_FILE.tmp"
-    die "Die sudo-Regel wurde von visudo abgelehnt – nichts geändert."
-  fi
-  sudo chown root:wheel "$SUDOERS_FILE.tmp" && sudo chmod 440 "$SUDOERS_FILE.tmp" &&
-    sudo mv -f "$SUDOERS_FILE.tmp" "$SUDOERS_FILE" || die "Konnte die sudo-Regel nicht aktivieren."
-  if sudo -k -n "$HELPER" ping >/dev/null 2>&1; then
-    echo "✓ sudo-Regel aktiv"
-  else
-    echo "⚠ Die sudo-Regel greift nicht. Prüfe, ob /etc/sudoers die Zeile"
-    echo "  '#includedir /private/etc/sudoers.d' enthält."
+    if command -v mas >/dev/null 2>&1; then
+      echo
+      echo "App-Store-Apps nachts automatisch aktualisieren: \"mas update\" braucht root."
+      echo "  Dafür kommt ein Helper dazu, den macupdate per sudo ohne Passwort starten darf –"
+      echo "  er kann aber nur \"mas update\" und nimmt keine Argumente. Kein Passwort wird gespeichert."
+      ask_yes_no "App-Store-Apps automatisch aktualisieren?" j && store=1
+    fi
+    # Welche mas-Version als root läuft – vor der Admin-Abfrage, damit alle Fragen vorher kommen
+    if (( store )) && ! choose_store_mas; then store=0; fi
   fi
 
-  # 6) Passwort für macOS-Updates (nur Apple Silicon)
-  if is_arm; then setup_arm_credential; fi
-
-  # 7) Fehlende Craft-Apps
+  # 3) Fehlende Craft-Apps
   check_missing_apps
 
-  # 8) Aufwecken
+  # 4) Aufwecken
   echo
   echo "Damit der Lauf auch nachts klappt, kann macOS den Mac kurz vorher aufwecken."
   echo "  Zuverlässig nur am Netzteil; bei zugeklapptem MacBook nicht garantiert."
@@ -1913,29 +2025,46 @@ EOF_INTRO
   else
     settings_set WAKE_MAC no; WAKE_MAC=no
   fi
+  echo
 
-  # 9) Zeitplan (LaunchAgent)
+  # 5) Admin-Schritte: einmal vorab anmelden, damit nichts nur halb passiert.
+  #    Läuft --install schon aus $INSTALL_BIN, muss dort nichts kopiert werden.
+  [[ $(resolve_path "$src") == "$(resolve_path "$INSTALL_BIN")" ]] && copy=0
+  (( copy )) && needs_root_for "$INSTALL_BIN" && need_root=1
+  [[ -n $(legacy_files) || $(wake_wanted) != "$(wake_applied)" ]] && need_root=1
+  # Helper einrichten – oder einen vorhandenen entfernen, wenn du ihn nicht mehr willst
+  if (( store )) || store_files_present; then need_root=1; fi
+  if (( need_root )); then
+    as_root -v || die "Ohne Admin-Rechte geht es nicht weiter – nichts geändert."
+  fi
+  install_command "$src" || die "Konnte $INSTALL_BIN nicht schreiben."
+  echo "✓ Befehl installiert: $INSTALL_BIN"
+  remove_legacy
+  store_txt="nur prüfen"
+  if (( store )); then
+    install_store_helper "$STORE_MAS_SRC" && store_txt="automatisch"
+  else
+    remove_store_helper
+  fi
+
+  # 6) Zeitplan (LaunchAgent) und Aufwecken
   h=$(time_h "$UPDATE_TIME"); m=$(time_m "$UPDATE_TIME")
   write_agent_plist "$h" "$m"
   plutil -lint "$AGENT_PLIST" >/dev/null 2>&1 || die "Die Zeitplan-Datei ist ungültig – bitte melden."
   if reload_agent; then echo "✓ Zeitplan aktiv: täglich um $UPDATE_TIME"; else echo "⚠ Zeitplan konnte nicht geladen werden"; fi
-  apply_schedule
-  stop_sudo_keepalive
+  apply_schedule --wake
 
-  cred_state="nicht nötig (Intel-Mac)"
-  if is_arm; then
-    if sudo -n "$HELPER" has-cred >/dev/null 2>&1; then cred_state="hinterlegt – Systemupdates vollautomatisch"
-    else cred_state="nicht hinterlegt – Systemupdates werden nur heruntergeladen"; fi
-  fi
   wake_txt="nein"
   [[ $WAKE_MAC == yes ]] && wake_txt="ja, um $(wake_time_for "$UPDATE_TIME")"
+  [[ $UPDATE_APPSTORE == yes ]] || store_txt="ausgeschaltet"
   cat <<EOF_DONE
 
 ✓ Fertig eingerichtet.
 
-  Täglich um $UPDATE_TIME:  Craft-Apps → Homebrew → App Store → macOS
+  Täglich um $UPDATE_TIME:  Craft-Apps → Homebrew → App Store
+  App Store:         $store_txt
   Mac wecken:        $wake_txt
-  macOS-Passwort:    $cred_state
+  macOS-Updates:     macOS selbst (macupdate wartet, solange eins läuft)
 
 So geht's weiter:
   macupdate -c        nur nachsehen, was es Neues gibt (installiert nichts)
@@ -1948,29 +2077,34 @@ EOF_DONE
 }
 
 cmd_uninstall() {
-  local wake
+  local bin_root=0
+  trap drop_root EXIT
   is_macos || die "macupdate läuft nur auf macOS."
   [[ $EUID -eq 0 && -z $_R ]] && die "Bitte ohne sudo starten:  macupdate --uninstall"
   lock_is_held && die "Gerade läuft ein macupdate-Lauf – bitte warten, bis er fertig ist."
   ask_yes_no "macupdate wirklich entfernen?" n || exit 0
-  # sudo zuerst – sonst bliebe bei falschem Passwort eine halb entfernte Einrichtung zurück
-  sudo -v || die "sudo fehlgeschlagen."
-  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1
-  rm -f "$AGENT_PLIST"
-  echo "✓ Zeitplan entfernt"
-  wake=$(cat "$WAKE_STATE_FILE" 2>/dev/null)
-  if [[ -n $wake && $wake != off ]]; then
-    sudo pmset repeat cancel && echo "✓ Automatisches Aufwecken entfernt"
+  [[ -e $INSTALL_BIN || -e $INSTALL_BIN.new ]] && needs_root_for "$INSTALL_BIN" && bin_root=1
+  # Admin-Rechte zuerst – sonst bliebe bei falschem Passwort eine halb entfernte Einrichtung zurück
+  if (( bin_root )) || store_files_present || [[ -n $(legacy_files) || $(wake_applied) != off ]]; then
+    as_root -v || die "Ohne Admin-Rechte geht es nicht weiter – nichts geändert."
   fi
-  sudo rm -f "$SUDOERS_FILE" && echo "✓ sudo-Regel entfernt"
-  sudo rm -f "$HELPER" "$HELPER_MAS" "$HELPER_CRED" && echo "✓ Root-Helper und gespeichertes Passwort entfernt"
+  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1
+  rm -f "$AGENT_PLIST" "$AGENT_PLIST.tmp"
+  echo "✓ Zeitplan entfernt"
+  [[ $(wake_applied) != off ]] && set_wake off
+  remove_store_helper
+  remove_legacy
   if ask_yes_no "Einstellungen, Protokolle und App-Backups auch löschen?" n; then
     rm -rf "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
     echo "✓ Einstellungen, Protokolle und Backups gelöscht"
   else
     rm -f "$WAKE_STATE_FILE"
   fi
-  sudo rm -f "$INSTALL_BIN" && echo "✓ $INSTALL_BIN entfernt"
+  if (( bin_root )); then
+    as_root rm -f "$INSTALL_BIN" "$INSTALL_BIN.new"
+  else
+    rm -f "$INSTALL_BIN" "$INSTALL_BIN.new"
+  fi && echo "✓ $INSTALL_BIN entfernt"
   echo "macupdate ist entfernt. Die installierten Apps bleiben erhalten."
 }
 
@@ -1993,7 +2127,6 @@ main() {
     -s|--skip)        cmd_skip ;;
     --unskip)         cmd_unskip ;;
     -e|--edit)        cmd_edit ;;
-    --settings)       cmd_edit ;;   # alter Name, bleibt für bestehende Gewohnheiten erhalten
     --status)         cmd_status ;;
     -l|--log)         cmd_log ;;
     -h|--help|"")     cmd_help ;;
